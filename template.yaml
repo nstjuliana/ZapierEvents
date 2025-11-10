@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Zapier Triggers API - Phase 0 Setup
+Description: Zapier Triggers API - Phase 1 MVP Core Event Ingestion
 
 Globals:
   Function:
@@ -10,12 +10,26 @@ Globals:
     Environment:
       Variables:
         LOG_LEVEL: INFO
+        EVENTS_TABLE_NAME: !Ref EventsTable
+        API_KEYS_TABLE_NAME: !Ref APIKeysTable
+        AWS_REGION: !Ref AWS::Region
 
 Resources:
   TriggersApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: $default
+      Auth:
+        Authorizers:
+          ApiKeyAuthorizer:
+            AuthorizerPayloadFormatVersion: '2.0'
+            FunctionArn: !GetAtt ApiKeyAuthorizer.Arn
+            FunctionInvokeRole: !GetAtt ApiKeyAuthorizerInvokeRole.Arn
+            Identity:
+              Headers:
+                - authorization
+              ReauthorizeEvery: 300  # 5 minutes cache
+        DefaultAuthorizer: ApiKeyAuthorizer
       CorsConfiguration:
         AllowOrigins:
           - "*"
@@ -25,12 +39,17 @@ Resources:
         AllowHeaders:
           - "*"
 
-  HealthFunction:
+  EventsFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: main.handler
-      Description: Health check endpoint
+      Description: Events API handler for ingestion and retrieval
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref APIKeysTable
       Events:
         HealthCheck:
           Type: HttpApi
@@ -38,6 +57,106 @@ Resources:
             ApiId: !Ref TriggersApi
             Path: /health
             Method: GET
+        CreateEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events
+            Method: POST
+
+  # Authorizer IAM Role
+  ApiKeyAuthorizerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Policies:
+        - PolicyName: DynamoDBReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt APIKeysTable.Arn
+
+  # API Key Authorizer Lambda Function
+  ApiKeyAuthorizer:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: src.auth.authorizer.lambda_handler
+      Description: API key authentication authorizer
+      Runtime: python3.11
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          API_KEYS_TABLE_NAME: !Ref APIKeysTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref APIKeysTable
+
+  # DynamoDB Tables
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-events'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: dev
+        - Key: Service
+          Value: triggers-api
+
+  APIKeysTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-api-keys'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: key_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: key_id
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: dev
+        - Key: Service
+          Value: triggers-api
 
 Outputs:
   ApiUrl:
@@ -46,7 +165,19 @@ Outputs:
   HealthEndpoint:
     Description: Health check endpoint URL
     Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com/health'
-  HealthFunctionArn:
-    Description: Health Function ARN
-    Value: !GetAtt HealthFunction.Arn
+  EventsEndpoint:
+    Description: Events API endpoint URL
+    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com/events'
+  EventsFunctionArn:
+    Description: Events Function ARN
+    Value: !GetAtt EventsFunction.Arn
+  ApiKeyAuthorizerArn:
+    Description: API Key Authorizer Function ARN
+    Value: !GetAtt ApiKeyAuthorizer.Arn
+  EventsTableName:
+    Description: Events DynamoDB table name
+    Value: !Ref EventsTable
+  APIKeysTableName:
+    Description: API Keys DynamoDB table name
+    Value: !Ref APIKeysTable
 
