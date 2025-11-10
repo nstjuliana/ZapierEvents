@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Zapier Triggers API - Phase 0 Setup
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Resources:
+  TriggersApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+        AllowHeaders:
+          - "*"
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: main.handler
+      Description: Health check endpoint
+      Events:
+        HealthCheck:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /health
+            Method: GET
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com'
+  HealthEndpoint:
+    Description: Health check endpoint URL
+    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com/health'
+  HealthFunctionArn:
+    Description: Health Function ARN
+    Value: !GetAtt HealthFunction.Arn
+
