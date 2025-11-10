@@ -10,9 +10,9 @@ This package contains all data models used by the Triggers API:
 All models are exported here for convenient importing.
 """
 
-from models.event import Event
-from models.request import CreateEventRequest
-from models.response import EventResponse
+from .event import Event
+from .request import CreateEventRequest
+from .response import EventResponse
 
 __all__ = [
     "Event",

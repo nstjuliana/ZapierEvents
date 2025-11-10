@@ -226,3 +226,193 @@ class TestEventHandlers:
 
             assert exc_info.value.status_code == 500
             assert "Failed to create event" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_get_event_success(self, db_client):
+        """Test get_event function with valid event."""
+        from src.handlers.events import get_event
+        from src.models.event import Event
+
+        # Create mock event
+        mock_event = Event(
+            event_id="evt_test123456",
+            event_type="order.created",
+            payload={"order_id": "123"},
+            metadata={"source": "test"},
+            status="pending",
+            created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+            delivered_at=None,
+            delivery_attempts=0
+        )
+
+        with patch.object(db_client, 'get_event', new_callable=AsyncMock, return_value=mock_event):
+            response = await get_event("evt_test123456", db_client)
+
+            assert isinstance(response, EventResponse)
+            assert response.event_id == "evt_test123456"
+            assert response.event_type == "order.created"
+            assert response.payload == {"order_id": "123"}
+            assert response.metadata == {"source": "test"}
+            assert response.status == "pending"
+            assert response.delivery_attempts == 0
+            assert response.message == "Event retrieved successfully"
+
+    @pytest.mark.asyncio
+    async def test_get_event_not_found(self, db_client):
+        """Test get_event function with non-existent event."""
+        from src.handlers.events import get_event
+
+        with patch.object(db_client, 'get_event', new_callable=AsyncMock, return_value=None):
+            with pytest.raises(HTTPException) as exc_info:
+                await get_event("evt_nonexistent", db_client)
+
+            assert exc_info.value.status_code == 404
+            assert "Event evt_nonexistent not found" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_get_event_database_error(self, db_client):
+        """Test get_event function with database error."""
+        from src.handlers.events import get_event
+
+        with patch.object(db_client, 'get_event', side_effect=Exception("DB error")):
+            with pytest.raises(HTTPException) as exc_info:
+                await get_event("evt_test123", db_client)
+
+            assert exc_info.value.status_code == 500
+            assert "Failed to retrieve event" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_list_events_success(self, db_client):
+        """Test list_events function with valid parameters."""
+        from src.handlers.events import list_events
+        from src.models.event import Event
+
+        # Create mock events
+        mock_events = [
+            Event(
+                event_id="evt_test123456",
+                event_type="order.created",
+                payload={"order_id": "123"},
+                status="pending",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+                delivered_at=None,
+                delivery_attempts=0
+            ),
+            Event(
+                event_id="evt_test789012",
+                event_type="user.created",
+                payload={"user_id": "456"},
+                status="delivered",
+                created_at=datetime(2024, 1, 15, 10, 30, 2, tzinfo=timezone.utc),
+                delivered_at=datetime(2024, 1, 15, 10, 30, 3, tzinfo=timezone.utc),
+                delivery_attempts=1
+            )
+        ]
+
+        with patch.object(db_client, 'list_events', new_callable=AsyncMock, return_value=mock_events) as mock_list:
+            response = await list_events(status="pending", limit=10, cursor=None, db_client=db_client)
+
+            assert isinstance(response, list)
+            assert len(response) == 2
+
+            # Verify list_events was called with correct parameters
+            mock_list.assert_called_once_with(status="pending", limit=10, cursor=None)
+
+            # Check response structure
+            assert response[0].event_id == "evt_test123456"
+            assert response[0].event_type == "order.created"
+            assert response[0].status == "pending"
+            assert response[0].message == "Event retrieved successfully"
+
+    @pytest.mark.asyncio
+    async def test_list_events_limit_validation(self, db_client):
+        """Test list_events function with invalid limit."""
+        from src.handlers.events import list_events
+
+        with pytest.raises(HTTPException) as exc_info:
+            await list_events(status=None, limit=150, cursor=None, db_client=db_client)
+
+        assert exc_info.value.status_code == 400
+        assert "Limit cannot exceed 100" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_list_events_database_error(self, db_client):
+        """Test list_events function with database error."""
+        from src.handlers.events import list_events
+
+        with patch.object(db_client, 'list_events', side_effect=Exception("DB error")):
+            with pytest.raises(HTTPException) as exc_info:
+                await list_events(status=None, limit=10, cursor=None, db_client=db_client)
+
+            assert exc_info.value.status_code == 500
+            assert "Failed to list events" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_event_success(self, db_client):
+        """Test acknowledge_event function with valid event."""
+        from src.handlers.events import acknowledge_event
+        from src.models.event import Event
+
+        # Create mock event
+        mock_event = Event(
+            event_id="evt_test123456",
+            event_type="order.created",
+            payload={"order_id": "123"},
+            status="pending",
+            created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+            delivered_at=None,
+            delivery_attempts=0
+        )
+
+        with patch.object(db_client, 'get_event', new_callable=AsyncMock, return_value=mock_event):
+            with patch.object(db_client, 'update_event', new_callable=AsyncMock) as mock_update:
+                # Call acknowledge_event
+                result = await acknowledge_event("evt_test123456", db_client)
+
+                # Should return None (204 No Content)
+                assert result is None
+
+                # Verify update_event was called
+                mock_update.assert_called_once()
+                updated_event = mock_update.call_args[0][0]
+
+                # Verify event was updated
+                assert updated_event.status == "delivered"
+                assert updated_event.delivered_at is not None
+                assert updated_event.delivery_attempts == 1
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_event_not_found(self, db_client):
+        """Test acknowledge_event function with non-existent event."""
+        from src.handlers.events import acknowledge_event
+
+        with patch.object(db_client, 'get_event', new_callable=AsyncMock, return_value=None):
+            with pytest.raises(HTTPException) as exc_info:
+                await acknowledge_event("evt_nonexistent", db_client)
+
+            assert exc_info.value.status_code == 404
+            assert "Event evt_nonexistent not found" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_event_database_error(self, db_client):
+        """Test acknowledge_event function with database error."""
+        from src.handlers.events import acknowledge_event
+        from src.models.event import Event
+
+        mock_event = Event(
+            event_id="evt_test123456",
+            event_type="order.created",
+            payload={"order_id": "123"},
+            status="pending",
+            created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+            delivered_at=None,
+            delivery_attempts=0
+        )
+
+        with patch.object(db_client, 'get_event', new_callable=AsyncMock, return_value=mock_event):
+            with patch.object(db_client, 'update_event', side_effect=Exception("DB error")):
+                with pytest.raises(HTTPException) as exc_info:
+                    await acknowledge_event("evt_test123456", db_client)
+
+                assert exc_info.value.status_code == 500
+                assert "Failed to acknowledge event" in exc_info.value.detail

@@ -7,11 +7,13 @@ Globals:
     Runtime: python3.11
     Timeout: 30
     MemorySize: 512
+    Tracing: Active
     Environment:
       Variables:
         LOG_LEVEL: INFO
         EVENTS_TABLE_NAME: !Ref EventsTable
         API_KEYS_TABLE_NAME: !Ref APIKeysTable
+        AWS_XRAY_TRACING_NAME: triggers-api
 
 Resources:
   TriggersApi:
@@ -61,8 +63,31 @@ Resources:
             ApiId: !Ref TriggersApi
             Path: /events
             Method: POST
-            Auth:
-              Authorizer: ApiKeyAuthorizer
+            # Auth disabled - /events endpoint is publicly accessible
+        GetEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events/{id}
+            Method: GET
+        ListEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events
+            Method: GET
+        GetInbox:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /inbox
+            Method: GET
+        AcknowledgeEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events/{id}/acknowledge
+            Method: POST
 
   # Authorizer IAM Role
   ApiKeyAuthorizerInvokeRole:
@@ -181,3 +206,118 @@ Outputs:
     Description: API Keys DynamoDB table name
     Value: !Ref APIKeysTable
 
+  # CloudWatch Dashboard for monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["TriggersAPI", "EventCreated", {"stat": "Sum"}],
+                  [".", "EventDelivered", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Event Throughput",
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["TriggersAPI", "InboxDepth", {"stat": "Maximum"}]
+                ],
+                "period": 300,
+                "stat": "Maximum",
+                "region": "${AWS::Region}",
+                "title": "Inbox Depth",
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", {"stat": "Average"}],
+                  [".", ".", {"stat": "p95"}],
+                  [".", ".", {"stat": "p99"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "API Latency (Lambda Duration)"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Errors", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Errors",
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Invocations",
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", {"stat": "Sum"}],
+                  [".", "4XXError", {"stat": "Sum"}],
+                  [".", "5XXError", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics",
+                "yAxis": {"left": {"min": 0}}
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com'
+  HealthEndpoint:
+    Description: Health check endpoint URL
+    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com/health'
+  EventsEndpoint:
+    Description: Events API endpoint URL
+    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com/events'
+  EventsFunctionArn:
+    Description: Events Function ARN
+    Value: !GetAtt EventsFunction.Arn
+  ApiKeyAuthorizerArn:
+    Description: API Key Authorizer Function ARN
+    Value: !GetAtt ApiKeyAuthorizer.Arn
+  EventsTableName:
+    Description: Events DynamoDB table name
+    Value: !Ref EventsTable
+  APIKeysTableName:
+    Description: API Keys DynamoDB table name
+    Value: !Ref APIKeysTable

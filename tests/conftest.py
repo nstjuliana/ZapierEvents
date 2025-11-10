@@ -8,14 +8,52 @@ service mocking to enable fast, isolated unit tests.
 """
 
 import pytest
-from moto import mock_dynamodb
+from moto import mock_aws
 import boto3
 from datetime import datetime, timezone
 
-from src.config.settings import Settings
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from src.models.event import Event
 from src.models.request import CreateEventRequest
 from src.storage.dynamodb import DynamoDBClient
+
+
+class TestSettings(BaseSettings):
+    """Test settings that don't require environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=None,  # Disable .env file loading for tests
+        case_sensitive=False,
+        extra="ignore"
+    )
+
+    # Application settings
+    app_name: str = Field(default="Triggers API Test", description="Application name")
+    app_version: str = Field(default="0.1.0-test", description="Application version")
+    log_level: str = Field(default="DEBUG", description="Logging level")
+
+    # AWS settings
+    aws_region: str = Field(default="us-east-1", description="AWS region")
+    stage: str = Field(default="test", description="Deployment stage")
+
+    # DynamoDB settings
+    events_table_name: str = Field(
+        default="test-events-table",
+        description="Name of the DynamoDB events table"
+    )
+    api_keys_table_name: str = Field(
+        default="test-api-keys-table",
+        description="Name of the DynamoDB API keys table"
+    )
+
+    # Security settings
+    bcrypt_work_factor: int = Field(
+        default=4,  # Faster for tests
+        ge=4,
+        le=16,
+        description="bcrypt work factor for API key hashing"
+    )
 
 
 @pytest.fixture
@@ -26,16 +64,7 @@ def test_settings():
     Overrides production settings with test-appropriate values.
     Disables environment variable loading for predictable tests.
     """
-    return Settings(
-        app_name="Triggers API Test",
-        app_version="0.1.0-test",
-        log_level="DEBUG",
-        aws_region="us-east-1",
-        stage="test",
-        events_table_name="test-events-table",
-        api_keys_table_name="test-api-keys-table",
-        bcrypt_work_factor=4,  # Faster for tests
-    )
+    return TestSettings()
 
 
 @pytest.fixture
@@ -90,7 +119,7 @@ def sample_event_model(sample_event):
 
 
 @pytest.fixture
-@mock_dynamodb
+@mock_aws
 def mock_dynamodb_table(test_settings):
     """
     Create mock DynamoDB table for events testing.
@@ -150,7 +179,7 @@ def mock_dynamodb_table(test_settings):
 
 
 @pytest.fixture
-@mock_dynamodb
+@mock_aws
 def mock_api_keys_table(test_settings):
     """
     Create mock DynamoDB table for API keys testing.

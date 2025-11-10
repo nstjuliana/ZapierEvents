@@ -269,3 +269,252 @@ class TestApiIntegration:
 
         assert data["error"]["code"] == 400
         assert isinstance(data["error"]["message"], str)
+
+    def test_get_event_success(self, test_client, sample_event):
+        """Test GET /events/{id} returns event details."""
+        # First create an event
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'put_event', new_callable=AsyncMock) as mock_put:
+
+            create_response = test_client.post("/events", json=sample_event)
+            assert create_response.status_code == 201
+            event_id = create_response.json()["event_id"]
+
+        # Mock get_event to return the event
+        mock_event = type('MockEvent', (), {
+            'event_id': event_id,
+            'event_type': sample_event['event_type'],
+            'payload': sample_event['payload'],
+            'metadata': sample_event.get('metadata'),
+            'status': 'pending',
+            'created_at': '2024-01-15T10:30:01Z',
+            'delivered_at': None,
+            'delivery_attempts': 0
+        })()
+
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'get_event', new_callable=AsyncMock, return_value=mock_event):
+
+            response = test_client.get(f"/events/{event_id}")
+            assert response.status_code == 200
+
+            data = response.json()
+            assert data["event_id"] == event_id
+            assert data["event_type"] == sample_event["event_type"]
+            assert data["payload"] == sample_event["payload"]
+            assert data["status"] == "pending"
+            assert data["created_at"] == "2024-01-15T10:30:01Z"
+            assert data["delivered_at"] is None
+            assert data["delivery_attempts"] == 0
+            assert "Event retrieved successfully" in data["message"]
+
+    def test_get_event_not_found(self, test_client):
+        """Test GET /events/{id} returns 404 for non-existent event."""
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'get_event', new_callable=AsyncMock, return_value=None):
+
+            response = test_client.get("/events/evt_nonexistent123")
+            assert response.status_code == 404
+
+            data = response.json()
+            assert "error" in data
+            assert data["error"]["code"] == 404
+            assert "Event evt_nonexistent123 not found" in data["error"]["message"]
+
+    def test_list_events_basic(self, test_client):
+        """Test GET /events returns paginated list."""
+        mock_events = [
+            type('MockEvent', (), {
+                'event_id': 'evt_abc123xyz456',
+                'event_type': 'order.created',
+                'payload': {'order_id': '123'},
+                'metadata': None,
+                'status': 'pending',
+                'created_at': '2024-01-15T10:30:01Z',
+                'delivered_at': None,
+                'delivery_attempts': 0
+            })(),
+            type('MockEvent', (), {
+                'event_id': 'evt_def456uvw789',
+                'event_type': 'user.created',
+                'payload': {'user_id': '456'},
+                'metadata': {'source': 'api'},
+                'status': 'delivered',
+                'created_at': '2024-01-15T10:30:02Z',
+                'delivered_at': '2024-01-15T10:30:03Z',
+                'delivery_attempts': 1
+            })()
+        ]
+
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'list_events', new_callable=AsyncMock, return_value=mock_events):
+
+            response = test_client.get("/events")
+            assert response.status_code == 200
+
+            data = response.json()
+            assert isinstance(data, list)
+            assert len(data) == 2
+
+            # Check first event
+            event1 = data[0]
+            assert event1["event_id"] == "evt_abc123xyz456"
+            assert event1["event_type"] == "order.created"
+            assert event1["status"] == "pending"
+            assert event1["delivery_attempts"] == 0
+
+            # Check second event
+            event2 = data[1]
+            assert event2["event_id"] == "evt_def456uvw789"
+            assert event2["event_type"] == "user.created"
+            assert event2["status"] == "delivered"
+            assert event2["delivery_attempts"] == 1
+
+    def test_list_events_with_filters(self, test_client):
+        """Test GET /events with status filtering."""
+        mock_events = [
+            type('MockEvent', (), {
+                'event_id': 'evt_abc123xyz456',
+                'event_type': 'order.created',
+                'payload': {'order_id': '123'},
+                'metadata': None,
+                'status': 'pending',
+                'created_at': '2024-01-15T10:30:01Z',
+                'delivered_at': None,
+                'delivery_attempts': 0
+            })()
+        ]
+
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'list_events', new_callable=AsyncMock, return_value=mock_events) as mock_list:
+
+            response = test_client.get("/events?status=pending&limit=10")
+            assert response.status_code == 200
+
+            # Verify list_events was called with correct parameters
+            mock_list.assert_called_once_with(status="pending", limit=10, cursor=None)
+
+    def test_list_events_limit_validation(self, test_client):
+        """Test GET /events validates limit parameter."""
+        response = test_client.get("/events?limit=150")
+        assert response.status_code == 400
+
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == 400
+        assert "Limit cannot exceed 100" in data["error"]["message"]
+
+    def test_get_inbox_success(self, test_client):
+        """Test GET /inbox returns pending events."""
+        mock_events = [
+            type('MockEvent', (), {
+                'event_id': 'evt_abc123xyz456',
+                'event_type': 'order.created',
+                'payload': {'order_id': '123'},
+                'metadata': None,
+                'status': 'pending',
+                'created_at': '2024-01-15T10:30:01Z',
+                'delivered_at': None,
+                'delivery_attempts': 0
+            })()
+        ]
+
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'list_events', new_callable=AsyncMock, return_value=mock_events) as mock_list:
+
+            response = test_client.get("/inbox?limit=50")
+            assert response.status_code == 200
+
+            data = response.json()
+            assert isinstance(data, list)
+            assert len(data) == 1
+
+            event = data[0]
+            assert event["event_id"] == "evt_abc123xyz456"
+            assert event["status"] == "pending"
+
+            # Verify list_events was called with status="pending"
+            mock_list.assert_called_once_with(status="pending", limit=50, cursor=None)
+
+    def test_get_inbox_limit_validation(self, test_client):
+        """Test GET /inbox validates limit parameter."""
+        response = test_client.get("/inbox?limit=150")
+        assert response.status_code == 400
+
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == 400
+        assert "Limit cannot exceed 100" in data["error"]["message"]
+
+    def test_acknowledge_event_success(self, test_client):
+        """Test POST /events/{id}/acknowledge updates event status."""
+        event_id = "evt_abc123xyz456"
+
+        # Mock event for retrieval
+        mock_event = type('MockEvent', (), {
+            'event_id': event_id,
+            'event_type': 'order.created',
+            'payload': {'order_id': '123'},
+            'metadata': None,
+            'status': 'pending',
+            'created_at': '2024-01-15T10:30:01Z',
+            'delivered_at': None,
+            'delivery_attempts': 0
+        })()
+
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'get_event', new_callable=AsyncMock, return_value=mock_event):
+            with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                             'update_event', new_callable=AsyncMock) as mock_update:
+
+                response = test_client.post(f"/events/{event_id}/acknowledge")
+                assert response.status_code == 204
+
+                # Verify update_event was called
+                mock_update.assert_called_once()
+                updated_event = mock_update.call_args[0][0]
+
+                # Verify event status was updated
+                assert updated_event.status == "delivered"
+                assert updated_event.delivered_at is not None
+                assert updated_event.delivery_attempts == 1
+
+    def test_acknowledge_event_not_found(self, test_client):
+        """Test POST /events/{id}/acknowledge returns 404 for non-existent event."""
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'get_event', new_callable=AsyncMock, return_value=None):
+
+            response = test_client.post("/events/evt_nonexistent123/acknowledge")
+            assert response.status_code == 404
+
+            data = response.json()
+            assert "error" in data
+            assert data["error"]["code"] == 404
+            assert "Event evt_nonexistent123 not found" in data["error"]["message"]
+
+    def test_acknowledge_event_database_error(self, test_client):
+        """Test POST /events/{id}/acknowledge handles database errors."""
+        event_id = "evt_abc123xyz456"
+        mock_event = type('MockEvent', (), {
+            'event_id': event_id,
+            'event_type': 'order.created',
+            'payload': {'order_id': '123'},
+            'metadata': None,
+            'status': 'pending',
+            'created_at': '2024-01-15T10:30:01Z',
+            'delivered_at': None,
+            'delivery_attempts': 0
+        })()
+
+        with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                         'get_event', new_callable=AsyncMock, return_value=mock_event):
+            with patch.object(test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)(),
+                             'update_event', side_effect=Exception("Database error")):
+
+                response = test_client.post(f"/events/{event_id}/acknowledge")
+                assert response.status_code == 500
+
+                data = response.json()
+                assert "error" in data
+                assert data["error"]["code"] == 500
+                assert "Failed to acknowledge event" in data["error"]["message"]

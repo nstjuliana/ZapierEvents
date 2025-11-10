@@ -1,7 +1,7 @@
 {
   "version": "2.0",
-  "routeKey": "GET /health",
-  "rawPath": "/health",
+  "routeKey": "GET /events",
+  "rawPath": "/events",
   "rawQueryString": "",
   "headers": {
     "accept": "*/*",
@@ -19,13 +19,13 @@
     "domainPrefix": "mmghecrjr5",
     "http": {
       "method": "GET",
-      "path": "/health",
+      "path": "/events",
       "protocol": "HTTP/1.1",
       "sourceIp": "1.2.3.4",
       "userAgent": "curl/7.68.0"
     },
     "requestId": "test-id",
-    "routeKey": "GET /health",
+    "routeKey": "GET /events",
     "stage": "dev",
     "time": "10/Nov/2025:18:37:00 +0000",
     "timeEpoch": 1699635420000

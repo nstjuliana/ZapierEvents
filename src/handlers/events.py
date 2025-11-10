@@ -19,8 +19,9 @@ Author: Triggers API Team
 
 from datetime import datetime, timezone
 from uuid import uuid4
-from fastapi import APIRouter, HTTPException, status, Depends
-from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi import status as status_codes
+from typing import List, Optional
 
 from models.request import CreateEventRequest
 from models.response import EventResponse
@@ -28,6 +29,7 @@ from models.event import Event
 from storage.dynamodb import DynamoDBClient
 from config.settings import settings
 from utils.logger import get_logger
+from utils.metrics import MetricsClient
 
 router = APIRouter(prefix="/events", tags=["events"])
 logger = get_logger(__name__)
@@ -47,10 +49,24 @@ def get_db_client() -> DynamoDBClient:
     return DynamoDBClient(table_name=settings.events_table_name)
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, response_model=EventResponse)
+def get_metrics_client() -> MetricsClient:
+    """
+    Dependency to get CloudWatch metrics client.
+
+    Creates and returns a configured MetricsClient instance
+    for publishing custom metrics.
+
+    Returns:
+        Configured MetricsClient instance
+    """
+    return MetricsClient()
+
+
+@router.post("", status_code=status_codes.HTTP_201_CREATED, response_model=EventResponse)
 async def create_event(
     request: CreateEventRequest,
-    db_client: DynamoDBClient = Depends(get_db_client)
+    db_client: DynamoDBClient = Depends(get_db_client),
+    metrics_client: MetricsClient = Depends(get_metrics_client)
 ) -> EventResponse:
     """
     Create and ingest a new event.
@@ -119,11 +135,26 @@ async def create_event(
             event_type=request.event_type
         )
 
+        # Publish metrics
+        try:
+            metrics_client.put_metric(
+                metric_name="EventCreated",
+                value=1.0,
+                dimensions={"EventType": request.event_type}
+            )
+        except Exception:
+            # Metrics failure shouldn't break event creation
+            pass
+
         return EventResponse(
             event_id=event.event_id,
+            event_type=event.event_type,
+            payload=event.payload,
+            metadata=event.metadata,
             status=event.status,
             created_at=event.created_at,
             delivered_at=event.delivered_at,
+            delivery_attempts=event.delivery_attempts,
             message="Event created successfully"
         )
 
@@ -135,7 +166,7 @@ async def create_event(
             event_type=getattr(request, 'event_type', 'unknown')
         )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status_codes.HTTP_400_BAD_REQUEST,
             detail=f"Invalid event data: {str(e)}"
         )
 
@@ -147,6 +178,210 @@ async def create_event(
             event_type=getattr(request, 'event_type', 'unknown')
         )
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create event"
+        )
+
+
+@router.get("/{event_id}", response_model=EventResponse)
+async def get_event(
+    event_id: str,
+    db_client: DynamoDBClient = Depends(get_db_client)
+) -> EventResponse:
+    """
+    Retrieve a specific event by ID.
+
+    Fetches an event from DynamoDB and returns its full details
+    including payload, metadata, and delivery status.
+
+    Args:
+        event_id: Unique event identifier
+        db_client: DynamoDB client (injected via dependency)
+
+    Returns:
+        EventResponse with complete event details
+
+    Raises:
+        HTTPException: 404 if event not found
+        HTTPException: 500 if database error
+
+    Example:
+        GET /events/evt_abc123xyz456
+
+        Response (200):
+        {
+            "event_id": "evt_abc123xyz456",
+            "status": "delivered",
+            "created_at": "2024-01-15T10:30:01Z",
+            "delivered_at": "2024-01-15T10:30:02Z",
+            "message": "Event retrieved successfully"
+        }
+    """
+    try:
+        event = await db_client.get_event(event_id)
+    except Exception as e:
+        logger.error("Database error retrieving event", event_id=event_id, error=str(e))
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve event"
+        )
+
+    if not event:
+        raise HTTPException(
+            status_code=status_codes.HTTP_404_NOT_FOUND,
+            detail=f"Event {event_id} not found"
+        )
+
+    return EventResponse(
+        event_id=event.event_id,
+        event_type=event.event_type,
+        payload=event.payload,
+        metadata=event.metadata,
+        status=event.status,
+        created_at=event.created_at,
+        delivered_at=event.delivered_at,
+        delivery_attempts=event.delivery_attempts,
+        message="Event retrieved successfully"
+    )
+
+
+@router.get("", response_model=List[EventResponse])
+async def list_events(
+    status: Optional[str] = None,
+    limit: int = 50,
+    cursor: Optional[str] = None,
+    db_client: DynamoDBClient = Depends(get_db_client)
+) -> List[EventResponse]:
+    """
+    List events with optional filtering and pagination.
+
+    Returns a paginated list of events, optionally filtered by status.
+    Uses cursor-based pagination for efficient handling of large datasets.
+
+    Args:
+        status: Optional status filter (pending, delivered, failed, replayed)
+        limit: Maximum number of events to return (default 50, max 100)
+        cursor: Pagination cursor from previous response
+        db_client: DynamoDB client (injected via dependency)
+
+    Returns:
+        List of EventResponse objects
+
+    Raises:
+        HTTPException: 400 if invalid parameters
+        HTTPException: 500 if database error
+
+    Example:
+        GET /events?status=pending&limit=10
+
+        Response (200):
+        [
+            {
+                "event_id": "evt_abc123xyz456",
+                "status": "pending",
+                "created_at": "2024-01-15T10:30:01Z",
+                "delivered_at": null,
+                "message": "Event retrieved successfully"
+            }
+        ]
+    """
+    if limit > 100:
+        raise HTTPException(
+            status_code=status_codes.HTTP_400_BAD_REQUEST,
+            detail="Limit cannot exceed 100"
+        )
+
+    try:
+        events = await db_client.list_events(
+            status=status,
+            limit=limit,
+            cursor=cursor
+        )
+    except Exception as e:
+        logger.error("Database error listing events", error=str(e))
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to list events"
+        )
+
+    return [
+        EventResponse(
+            event_id=event.event_id,
+            event_type=event.event_type,
+            payload=event.payload,
+            metadata=event.metadata,
+            status=event.status,
+            created_at=event.created_at,
+            delivered_at=event.delivered_at,
+            delivery_attempts=event.delivery_attempts,
+            message="Event retrieved successfully"
+        )
+        for event in events
+    ]
+
+
+@router.post("/{event_id}/acknowledge", status_code=status_codes.HTTP_204_NO_CONTENT)
+async def acknowledge_event(
+    event_id: str,
+    db_client: DynamoDBClient = Depends(get_db_client),
+    metrics_client: MetricsClient = Depends(get_metrics_client)
+) -> None:
+    """
+    Acknowledge successful event delivery.
+
+    Updates event status to 'delivered' and sets delivery timestamp.
+    Called by Zapier after successfully processing an event.
+
+    Args:
+        event_id: Unique event identifier to acknowledge
+        db_client: DynamoDB client
+
+    Raises:
+        HTTPException: 404 if event not found
+        HTTPException: 500 if database error
+
+    Example:
+        POST /events/evt_abc123xyz456/acknowledge
+
+        Response (204): No Content
+    """
+    try:
+        # Get event
+        event = await db_client.get_event(event_id)
+        if not event:
+            raise HTTPException(
+                status_code=status_codes.HTTP_404_NOT_FOUND,
+                detail=f"Event {event_id} not found"
+            )
+
+        # Update status
+        event.status = "delivered"
+        event.delivered_at = datetime.now(timezone.utc)
+
+        await db_client.update_event(event)
+
+        logger.info(
+            "Event acknowledged",
+            event_id=event_id,
+            event_type=event.event_type
+        )
+
+        # Publish metrics
+        try:
+            metrics_client.put_metric(
+                metric_name="EventDelivered",
+                value=1.0,
+                dimensions={"EventType": event.event_type}
+            )
+        except Exception:
+            # Metrics failure shouldn't break acknowledgment
+            pass
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to acknowledge event", event_id=event_id, error=str(e))
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to acknowledge event"
         )
