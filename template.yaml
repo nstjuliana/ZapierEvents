@@ -12,7 +12,6 @@ Globals:
         LOG_LEVEL: INFO
         EVENTS_TABLE_NAME: !Ref EventsTable
         API_KEYS_TABLE_NAME: !Ref APIKeysTable
-        AWS_REGION: !Ref AWS::Region
 
 Resources:
   TriggersApi:
@@ -29,7 +28,6 @@ Resources:
               Headers:
                 - authorization
               ReauthorizeEvery: 300  # 5 minutes cache
-        DefaultAuthorizer: ApiKeyAuthorizer
       CorsConfiguration:
         AllowOrigins:
           - "*"
@@ -63,6 +61,8 @@ Resources:
             ApiId: !Ref TriggersApi
             Path: /events
             Method: POST
+            Auth:
+              Authorizer: ApiKeyAuthorizer
 
   # Authorizer IAM Role
   ApiKeyAuthorizerInvokeRole:
@@ -93,7 +93,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
-      Handler: src.auth.authorizer.lambda_handler
+      Handler: auth.authorizer.lambda_handler
       Description: API key authentication authorizer
       Runtime: python3.11
       Timeout: 10

@@ -21,8 +21,8 @@ import boto3
 import os
 from typing import Dict, Any, Optional
 
-from src.auth.api_key import verify_api_key
-from src.utils.logger import get_logger
+from auth.api_key import verify_api_key
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
 

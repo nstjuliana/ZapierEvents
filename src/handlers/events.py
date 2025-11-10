@@ -22,12 +22,12 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, status, Depends
 from typing import Optional
 
-from src.models.request import CreateEventRequest
-from src.models.response import EventResponse
-from src.models.event import Event
-from src.storage.dynamodb import DynamoDBClient
-from src.config.settings import settings
-from src.utils.logger import get_logger
+from models.request import CreateEventRequest
+from models.response import EventResponse
+from models.event import Event
+from storage.dynamodb import DynamoDBClient
+from config.settings import settings
+from utils.logger import get_logger
 
 router = APIRouter(prefix="/events", tags=["events"])
 logger = get_logger(__name__)

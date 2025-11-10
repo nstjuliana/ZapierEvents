@@ -10,9 +10,9 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
-from src.handlers.events import router as events_router
-from src.config.settings import settings
-from src.utils.logger import get_logger
+from handlers.events import router as events_router
+from config.settings import settings
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
 

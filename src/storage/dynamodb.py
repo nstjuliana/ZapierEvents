@@ -20,8 +20,8 @@ from botocore.exceptions import ClientError
 from typing import Optional
 from datetime import datetime, timezone
 
-from src.models.event import Event
-from src.utils.logger import get_logger
+from models.event import Event
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
