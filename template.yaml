@@ -7,6 +7,10 @@ Parameters:
     Type: String
     Description: Zapier webhook URL for push delivery
     Default: https://hooks.zapier.com/hooks/catch/mock/
+  AlertEmail:
+    Type: String
+    Description: Email address for DLQ monitoring alerts
+    Default: alerts@triggers-api.example.com
 
 Globals:
   Function:
@@ -65,6 +69,7 @@ Resources:
             TableName: !Ref APIKeysTable
         - SQSSendMessagePolicy:
             QueueName: !GetAtt InboxQueue.QueueName
+        - CloudWatchPutMetricPolicy: {}
       Events:
         HealthCheck:
           Type: HttpApi
@@ -103,6 +108,35 @@ Resources:
             ApiId: !Ref TriggersApi
             Path: /events/{id}/acknowledge
             Method: POST
+
+  # SQS polling Lambda worker
+  DeliveryWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: delivery.worker.handler
+      Description: Process events from inbox queue and retry delivery
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsTable
+          ZAPIER_WEBHOOK_URL: !Ref ZapierWebhookUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt InboxQueue.QueueName
+        - CloudWatchPutMetricPolicy: {}
+
+  # Separate event source mapping for better control
+  DeliveryWorkerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: [InboxQueue, DeliveryWorkerFunction]
+    Properties:
+      FunctionName: !GetAtt DeliveryWorkerFunction.Arn
+      EventSourceArn: !GetAtt InboxQueue.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
 
   # Authorizer IAM Role
   ApiKeyAuthorizerInvokeRole:
@@ -225,6 +259,36 @@ Resources:
           Value: dev
         - Key: Service
           Value: triggers-api
+
+  # DLQ Monitoring and Alerts
+  DLQAlarmTopic:
+    Type: AWS::SNS::Topic
+    DependsOn: InboxDLQ
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-dlq-alarm'
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: [InboxDLQ, DLQAlarmTopic]
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-messages'
+      AlarmDescription: Alert when messages enter DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt InboxDLQ.QueueName
+      AlarmActions:
+        - !Ref DLQAlarmTopic
+      TreatMissingData: notBreaching
 
 Outputs:
   ApiUrl:
