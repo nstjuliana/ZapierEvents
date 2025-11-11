@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:Scan",
+        "dynamodb:Query"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:971422717446:table/triggers-api-dev-api-keys",
+        "arn:aws:dynamodb:us-east-1:971422717446:table/triggers-api-dev-api-keys/index/*"
+      ]
+    }
+  ]
+}

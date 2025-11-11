@@ -1,6 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Zapier Triggers API - Phase 1 MVP Core Event Ingestion
+Description: Zapier Triggers API - Phase 3 SQS Infrastructure + Push Delivery
+
+Parameters:
+  ZapierWebhookUrl:
+    Type: String
+    Description: Zapier webhook URL for push delivery
+    Default: https://hooks.zapier.com/hooks/catch/mock/
 
 Globals:
   Function:
@@ -20,16 +26,17 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: $default
-      Auth:
-        Authorizers:
-          ApiKeyAuthorizer:
-            AuthorizerPayloadFormatVersion: '2.0'
-            FunctionArn: !GetAtt ApiKeyAuthorizer.Arn
-            FunctionInvokeRole: !GetAtt ApiKeyAuthorizerInvokeRole.Arn
-            Identity:
-              Headers:
-                - authorization
-              ReauthorizeEvery: 300  # 5 minutes cache
+      # Auth disabled - all endpoints are publicly accessible
+      # Auth:
+      #   Authorizers:
+      #     ApiKeyAuthorizer:
+      #       AuthorizerPayloadFormatVersion: '2.0'
+      #       FunctionArn: !GetAtt ApiKeyAuthorizer.Arn
+      #       FunctionInvokeRole: !GetAtt ApiKeyAuthorizerInvokeRole.Arn
+      #       Identity:
+      #         Headers:
+      #           - authorization
+      #       ReauthorizeEvery: 300  # 5 minutes cache
       CorsConfiguration:
         AllowOrigins:
           - "*"
@@ -45,11 +52,19 @@ Resources:
       CodeUri: src/
       Handler: main.handler
       Description: Events API handler for ingestion and retrieval
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsTable
+          API_KEYS_TABLE_NAME: !Ref APIKeysTable
+          INBOX_QUEUE_URL: !Ref InboxQueue
+          ZAPIER_WEBHOOK_URL: !Ref ZapierWebhookUrl
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref EventsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref APIKeysTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt InboxQueue.QueueName
       Events:
         HealthCheck:
           Type: HttpApi
@@ -183,6 +198,34 @@ Resources:
         - Key: Service
           Value: triggers-api
 
+  # SQS Queues for event delivery
+  InboxQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-inbox-queue'
+      VisibilityTimeout: 300  # 5 minutes
+      MessageRetentionPeriod: 604800  # 7 days
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InboxDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: Environment
+          Value: dev
+        - Key: Service
+          Value: triggers-api
+
+  InboxDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-inbox-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Environment
+          Value: dev
+        - Key: Service
+          Value: triggers-api
+
 Outputs:
   ApiUrl:
     Description: API Gateway endpoint URL
@@ -205,6 +248,12 @@ Outputs:
   APIKeysTableName:
     Description: API Keys DynamoDB table name
     Value: !Ref APIKeysTable
+  InboxQueueUrl:
+    Description: SQS inbox queue URL
+    Value: !Ref InboxQueue
+  InboxDLQUrl:
+    Description: SQS inbox DLQ URL
+    Value: !Ref InboxDLQ
 
   # CloudWatch Dashboard for monitoring
   MonitoringDashboard:

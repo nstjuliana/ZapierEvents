@@ -1,0 +1,6 @@
+{
+  "headers": {
+    "authorization": "Bearer sk_GJQjTTzgIHonQfR4cUMf0_3B_pu5Q5Ww"
+  },
+  "methodArn": "arn:aws:execute-api:us-east-1:971422717446:mmghecrjr5/*/POST/events"
+}

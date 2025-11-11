@@ -39,6 +39,24 @@ class Settings(BaseSettings):
         description="Name of the DynamoDB API keys table"
     )
 
+    # SQS settings
+    inbox_queue_url: str = Field(
+        ...,
+        description="URL of the SQS inbox queue for failed deliveries"
+    )
+
+    # Delivery settings
+    zapier_webhook_url: str = Field(
+        ...,
+        description="Zapier webhook URL for push delivery"
+    )
+    delivery_timeout: int = Field(
+        default=10,
+        ge=1,
+        le=30,
+        description="HTTP timeout in seconds for delivery attempts"
+    )
+
     # Security settings
     bcrypt_work_factor: int = Field(
         default=13,

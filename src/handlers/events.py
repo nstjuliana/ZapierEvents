@@ -27,6 +27,8 @@ from models.request import CreateEventRequest
 from models.response import EventResponse
 from models.event import Event
 from storage.dynamodb import DynamoDBClient
+from sqs_queue.sqs import SQSClient
+from delivery.push import PushDeliveryClient
 from config.settings import settings
 from utils.logger import get_logger
 from utils.metrics import MetricsClient
@@ -62,25 +64,57 @@ def get_metrics_client() -> MetricsClient:
     return MetricsClient()
 
 
-@router.post("", status_code=status_codes.HTTP_201_CREATED, response_model=EventResponse)
+def get_sqs_client() -> SQSClient:
+    """
+    Dependency to get SQS client.
+
+    Creates and returns a configured SQSClient instance
+    for queueing failed deliveries.
+
+    Returns:
+        Configured SQSClient instance
+    """
+    return SQSClient(queue_url=settings.inbox_queue_url)
+
+
+def get_delivery_client() -> PushDeliveryClient:
+    """
+    Dependency to get push delivery client.
+
+    Creates and returns a configured PushDeliveryClient instance
+    for delivering events to Zapier webhooks.
+
+    Returns:
+        Configured PushDeliveryClient instance
+    """
+    return PushDeliveryClient(
+        webhook_url=settings.zapier_webhook_url,
+        timeout_seconds=settings.delivery_timeout
+    )
+
+
+@router.post("", status_code=status_codes.HTTP_202_ACCEPTED, response_model=EventResponse)
 async def create_event(
     request: CreateEventRequest,
     db_client: DynamoDBClient = Depends(get_db_client),
+    sqs_client: SQSClient = Depends(get_sqs_client),
+    delivery_client: PushDeliveryClient = Depends(get_delivery_client),
     metrics_client: MetricsClient = Depends(get_metrics_client)
 ) -> EventResponse:
     """
-    Create and ingest a new event.
+    Create and ingest a new event with automatic delivery attempt.
 
-    Validates the event payload, generates a unique event ID,
-    attempts to push the event to Zapier, and stores it in DynamoDB.
-    If push fails, the event is queued in SQS for later polling.
+    Attempts immediate push delivery to Zapier. If push succeeds,
+    marks event as delivered. If push fails, queues to SQS for retry.
 
     Args:
         request: CreateEventRequest containing event_type, payload, and metadata
         db_client: DynamoDB client (injected via dependency)
+        sqs_client: SQS client for queuing failed deliveries
+        delivery_client: Push delivery client for Zapier webhook
 
     Returns:
-        EventResponse with event details including generated ID
+        EventResponse with delivery status
 
     Raises:
         HTTPException: 400 if validation fails
@@ -94,13 +128,13 @@ async def create_event(
             "metadata": {"source": "ecommerce-platform"}
         }
 
-        Response (201):
+        Response (202):
         {
             "event_id": "evt_abc123xyz456",
-            "status": "pending",
+            "status": "delivered",
             "created_at": "2024-01-15T10:30:01Z",
-            "delivered_at": null,
-            "message": "Event created successfully"
+            "delivered_at": "2024-01-15T10:30:01Z",
+            "message": "Event delivered successfully"
         }
     """
     try:
@@ -126,16 +160,67 @@ async def create_event(
             delivery_attempts=0
         )
 
-        # Store in DynamoDB
+        # Store in DynamoDB first
         await db_client.put_event(event)
 
         logger.info(
-            "Event created successfully",
+            "Event stored in database",
             event_id=event_id,
             event_type=request.event_type
         )
 
-        # Publish metrics
+        # Attempt immediate push delivery
+        try:
+            delivery_success = await delivery_client.deliver_event(event)
+
+            if delivery_success:
+                # Update to delivered status
+                event.status = "delivered"
+                event.delivered_at = datetime.now(timezone.utc)
+                event.delivery_attempts = 1
+                await db_client.update_event(event)
+
+                logger.info("Event delivered immediately", event_id=event_id)
+
+                # Publish delivery metrics
+                try:
+                    metrics_client.put_metric(
+                        metric_name="EventDelivered",
+                        value=1.0,
+                        dimensions={"EventType": request.event_type}
+                    )
+                except Exception:
+                    pass
+
+            else:
+                # Queue to SQS for retry
+                await sqs_client.send_message(
+                    event_id=event_id,
+                    event_data=event.model_dump(mode='json')
+                )
+
+                logger.info("Event queued for retry", event_id=event_id)
+
+        except Exception as e:
+            # Queue to SQS as fallback
+            logger.warning(
+                "Push delivery failed, queueing to SQS",
+                event_id=event_id,
+                error=str(e)
+            )
+            try:
+                await sqs_client.send_message(
+                    event_id=event_id,
+                    event_data=event.model_dump(mode='json')
+                )
+            except Exception as queue_error:
+                logger.error(
+                    "Failed to queue event to SQS",
+                    event_id=event_id,
+                    error=str(queue_error)
+                )
+
+        # Publish creation metrics
         try:
             metrics_client.put_metric(
                 metric_name="EventCreated",
@@ -155,7 +240,7 @@ async def create_event(
             created_at=event.created_at,
             delivered_at=event.delivered_at,
             delivery_attempts=event.delivery_attempts,
-            message="Event created successfully"
+            message=f"Event {event.status}"
         )
 
     except ValueError as e:
