@@ -192,6 +192,10 @@ Resources:
           AttributeType: S
         - AttributeName: created_at
           AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: idempotency_key
+          AttributeType: S
       KeySchema:
         - AttributeName: event_id
           KeyType: HASH
@@ -201,6 +205,14 @@ Resources:
             - AttributeName: status
               KeyType: HASH
             - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: IdempotencyIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: idempotency_key
               KeyType: RANGE
           Projection:
             ProjectionType: ALL

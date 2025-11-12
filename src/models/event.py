@@ -83,6 +83,14 @@ class Event(BaseModel):
         ge=0,
         description="Number of delivery attempts"
     )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="User ID that created this event (for user-scoped idempotency)"
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        description="Client-provided idempotency key to prevent duplicate events"
+    )
 
     @field_validator('event_type')
     @classmethod

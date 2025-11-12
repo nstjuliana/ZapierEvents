@@ -19,9 +19,10 @@ Author: Triggers API Team
 
 from datetime import datetime, timezone
 from uuid import uuid4
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi import status as status_codes
-from typing import List, Optional
+from fastapi.responses import JSONResponse
+from typing import List, Optional, Union
 
 from models.request import CreateEventRequest
 from models.response import EventResponse
@@ -93,14 +94,47 @@ def get_delivery_client() -> PushDeliveryClient:
     )
 
 
-@router.post("", status_code=status_codes.HTTP_202_ACCEPTED, response_model=EventResponse)
+def get_user_id_from_request(request: Request) -> Optional[str]:
+    """
+    Extract user_id from API Gateway authorizer context.
+
+    When auth is enabled, the authorizer sets user_id in the context.
+    This function extracts it from the request scope.
+
+    Args:
+        request: FastAPI Request object
+
+    Returns:
+        user_id if available from authorizer, None otherwise
+    """
+    try:
+        # Access the raw Lambda event from Mangum
+        # The event is stored in request.scope by Mangum
+        event = request.scope.get('aws.event', {})
+        request_context = event.get('requestContext', {})
+        authorizer = request_context.get('authorizer', {})
+        context = authorizer.get('context', {})
+        user_id = context.get('userId')
+        
+        # Only return user_id if it's not the default 'authenticated-user'
+        if user_id and user_id != 'authenticated-user':
+            return user_id
+        
+        return None
+    except Exception:
+        # If auth is disabled or context not available, return None
+        return None
+
+
+@router.post("", status_code=status_codes.HTTP_201_CREATED, response_model=EventResponse)
 async def create_event(
     request: CreateEventRequest,
+    http_request: Request,
     db_client: DynamoDBClient = Depends(get_db_client),
     sqs_client: SQSClient = Depends(get_sqs_client),
     delivery_client: PushDeliveryClient = Depends(get_delivery_client),
     metrics_client: MetricsClient = Depends(get_metrics_client)
-) -> EventResponse:
+) -> Union[EventResponse, JSONResponse]:
     """
     Create and ingest a new event with automatic delivery attempt.
 
@@ -128,7 +162,7 @@ async def create_event(
             "metadata": {"source": "ecommerce-platform"}
         }
 
-        Response (202):
+        Response (201 Created - new event):
         {
             "event_id": "evt_abc123xyz456",
             "status": "delivered",
@@ -136,8 +170,55 @@ async def create_event(
             "delivered_at": "2024-01-15T10:30:01Z",
             "message": "Event delivered successfully"
         }
+
+        Response (200 OK - idempotent duplicate):
+        {
+            "event_id": "evt_abc123xyz456",
+            "status": "delivered",
+            "created_at": "2024-01-15T10:30:01Z",
+            "idempotency_key": "order-12345-2024-01-15",
+            "message": "Event already exists with this idempotency key"
+        }
     """
     try:
+        # Get user_id from authorizer context (if auth enabled) or request body (fallback)
+        user_id = get_user_id_from_request(http_request) or request.user_id
+        
+        # Check for idempotency key before creating new event
+        if request.idempotency_key:
+            existing_event = await db_client.get_event_by_idempotency_key(
+                user_id=user_id,
+                idempotency_key=request.idempotency_key
+            )
+
+            if existing_event:
+                logger.info(
+                    "Duplicate event creation prevented by idempotency key",
+                    idempotency_key=request.idempotency_key,
+                    user_id=user_id,
+                    existing_event_id=existing_event.event_id,
+                    event_type=request.event_type
+                )
+
+                # Return existing event with HTTP 200 (idempotent response)
+                response_data = EventResponse(
+                    event_id=existing_event.event_id,
+                    event_type=existing_event.event_type,
+                    payload=existing_event.payload,
+                    metadata=existing_event.metadata,
+                    status=existing_event.status,
+                    created_at=existing_event.created_at,
+                    delivered_at=existing_event.delivered_at,
+                    delivery_attempts=existing_event.delivery_attempts,
+                    user_id=existing_event.user_id,
+                    idempotency_key=existing_event.idempotency_key,
+                    message="Event already exists with this idempotency key"
+                )
+                return JSONResponse(
+                    content=response_data.model_dump(),
+                    status_code=status_codes.HTTP_200_OK
+                )
+
         # Generate unique event ID
         event_id = f"evt_{uuid4().hex[:12]}"
 
@@ -157,7 +238,9 @@ async def create_event(
             status="pending",
             created_at=datetime.now(timezone.utc),
             delivered_at=None,
-            delivery_attempts=0
+            delivery_attempts=0,
+            user_id=user_id,
+            idempotency_key=request.idempotency_key
         )
 
         # Store in DynamoDB first
@@ -240,6 +323,8 @@ async def create_event(
             created_at=event.created_at,
             delivered_at=event.delivered_at,
             delivery_attempts=event.delivery_attempts,
+            user_id=event.user_id,
+            idempotency_key=event.idempotency_key,
             message=f"Event {event.status}"
         )
 
@@ -326,6 +411,8 @@ async def get_event(
         created_at=event.created_at,
         delivered_at=event.delivered_at,
         delivery_attempts=event.delivery_attempts,
+        user_id=event.user_id,
+        idempotency_key=event.idempotency_key,
         message="Event retrieved successfully"
     )
 
@@ -399,6 +486,8 @@ async def list_events(
             created_at=event.created_at,
             delivered_at=event.delivered_at,
             delivery_attempts=event.delivery_attempts,
+            user_id=event.user_id,
+            idempotency_key=event.idempotency_key,
             message="Event retrieved successfully"
         )
         for event in events

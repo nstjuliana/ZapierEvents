@@ -101,6 +101,10 @@ class DynamoDBClient:
             if 'metadata' in item and item.get('metadata') is not None:
                 item['metadata'] = json.dumps(item['metadata'])
 
+            # Remove None values - DynamoDB doesn't allow None/null values
+            # Only include attributes that have actual values
+            item = {k: v for k, v in item.items() if v is not None}
+
             # Store in DynamoDB
             self.table.put_item(Item=item)
 
@@ -205,6 +209,124 @@ class DynamoDBClient:
             logger.error(
                 "Unexpected error retrieving event from DynamoDB",
                 event_id=event_id,
+                table_name=self.table_name,
+                error=str(e)
+            )
+            raise
+
+    async def get_event_by_idempotency_key(
+        self,
+        user_id: Optional[str],
+        idempotency_key: str
+    ) -> Optional[Event]:
+        """
+        Retrieve an event by user-scoped idempotency key.
+
+        Queries the IdempotencyIndex GSI to find events by (user_id, idempotency_key)
+        combination. This enables user-scoped deduplication of events.
+
+        Args:
+            user_id: User identifier (required for proper user scoping)
+            idempotency_key: Client-provided idempotency key
+
+        Returns:
+            Event model if found, None otherwise
+
+        Raises:
+            ClientError: If DynamoDB operation fails
+            ValueError: If parameters are invalid
+
+        Note:
+            When auth is disabled, user_id will be None. In this case, the method
+            currently returns None (no global deduplication). When auth is enabled,
+            user_id will be required and populated from the authorizer context.
+        """
+        if not idempotency_key or not isinstance(idempotency_key, str):
+            raise ValueError("idempotency_key must be a non-empty string")
+
+        # When auth is disabled, user_id is None. For now, we don't support
+        # global deduplication - only user-scoped deduplication when user_id is provided.
+        # TODO: When auth is enabled, make user_id required and remove this check.
+        if user_id is None:
+            logger.warning(
+                "Cannot check idempotency without user_id - auth is currently disabled",
+                idempotency_key=idempotency_key,
+                table_name=self.table_name
+            )
+            return None
+
+        try:
+            # Query the IdempotencyIndex GSI
+            response = self.table.query(
+                IndexName='IdempotencyIndex',
+                KeyConditionExpression='#user_id = :user_id AND #idempotency_key = :idempotency_key',
+                ExpressionAttributeNames={
+                    '#user_id': 'user_id',
+                    '#idempotency_key': 'idempotency_key'
+                },
+                ExpressionAttributeValues={
+                    ':user_id': user_id,
+                    ':idempotency_key': idempotency_key
+                },
+                Limit=1  # We only expect one result per (user_id, idempotency_key) pair
+            )
+
+            items = response.get('Items', [])
+            if not items:
+                logger.info(
+                    "No existing event found for idempotency key",
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                    table_name=self.table_name
+                )
+                return None
+
+            item = items[0]
+
+            # Deserialize payload and metadata from JSON strings to preserve types
+            # Handle both new format (JSON string) and old format (dict) for backward compatibility
+            if 'payload' in item:
+                if isinstance(item['payload'], str):
+                    item['payload'] = json.loads(item['payload'])
+            if 'metadata' in item and item.get('metadata') is not None:
+                if isinstance(item['metadata'], str):
+                    item['metadata'] = json.loads(item['metadata'])
+
+            # Convert ISO strings back to datetime objects
+            if 'created_at' in item:
+                item['created_at'] = datetime.fromisoformat(item['created_at'])
+            if 'delivered_at' in item and item['delivered_at'] is not None:
+                item['delivered_at'] = datetime.fromisoformat(item['delivered_at'])
+
+            # Convert to Event model
+            event = Event(**item)
+
+            logger.info(
+                "Existing event found for idempotency key",
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+                event_id=event.event_id,
+                table_name=self.table_name
+            )
+
+            return event
+
+        except ClientError as e:
+            logger.error(
+                "Failed to query event by idempotency key",
+                user_id=user_id,
+                idempotency_key=idempotency_key,
+                table_name=self.table_name,
+                error_code=e.response['Error']['Code'],
+                error_message=e.response['Error']['Message']
+            )
+            raise
+
+        except Exception as e:
+            logger.error(
+                "Unexpected error querying event by idempotency key",
+                user_id=user_id,
+                idempotency_key=idempotency_key,
                 table_name=self.table_name,
                 error=str(e)
             )
@@ -359,6 +481,10 @@ class DynamoDBClient:
                 item['payload'] = json.dumps(item['payload'])
             if 'metadata' in item and item.get('metadata') is not None:
                 item['metadata'] = json.dumps(item['metadata'])
+
+            # Remove None values - DynamoDB doesn't allow None/null values
+            # Only include attributes that have actual values
+            item = {k: v for k, v in item.items() if v is not None}
 
             # Update in DynamoDB (put_item will replace the entire item)
             self.table.put_item(Item=item)

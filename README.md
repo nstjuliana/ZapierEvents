@@ -36,30 +36,53 @@ This is a serverless API built with FastAPI and deployed on AWS Lambda using SAM
 
 ## Local Development
 
-### Run locally with Uvicorn
+### ⚡ Fast Local Development (Recommended)
 
+For fast local development, use **uvicorn directly** instead of SAM Local. This avoids Docker container overhead and is much faster:
+
+**Option 1: Use the run script (easiest)**
+```bash
+# Windows
+run_local.bat
+
+# Linux/Mac
+python run_local.py --reload
+```
+
+**Option 2: Run uvicorn directly**
 ```bash
 uvicorn src.main:app --reload --port 8000
 ```
 
-Visit http://localhost:8000/health to see the health check endpoint.
+**Setup:**
+1. Create a `.env` file in the project root (copy from `.env.example` if available)
+2. Set required environment variables:
+   - `EVENTS_TABLE_NAME` (e.g., `test-events-table`)
+   - `API_KEYS_TABLE_NAME` (e.g., `test-api-keys-table`)
+   - `INBOX_QUEUE_URL` (e.g., `https://sqs.us-east-1.amazonaws.com/123456789/test-queue`)
+   - `ZAPIER_WEBHOOK_URL` (e.g., `https://hooks.zapier.com/hooks/catch/test/`)
 
-API documentation is available at:
-- Swagger UI: http://localhost:8000/docs
+**Access:**
+- Health check: http://localhost:8000/health
+- API docs: http://localhost:8000/docs
 - ReDoc: http://localhost:8000/redoc
 
-### Test locally with SAM CLI
+### 🐳 SAM Local (Lambda Testing - Slow)
+
+**Only use SAM Local when you need to test Lambda-specific behavior.** It's much slower because it uses Docker containers:
 
 ```bash
 # Build the application
 sam build
 
-# Start local API
-sam local start-api --port 3000
+# Start local API (add --skip-pull-image to avoid rebuilding images)
+sam local start-api --port 3000 --skip-pull-image
 
 # In another terminal, test the endpoint
 curl http://localhost:3000/health
 ```
+
+**Note:** SAM Local rebuilds Docker images on each request, making it very slow for development. Use uvicorn for day-to-day development instead.
 
 ## Deployment
 

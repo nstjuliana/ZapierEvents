@@ -119,6 +119,8 @@ async def get_inbox(
                 created_at=event.created_at,
                 delivered_at=event.delivered_at,
                 delivery_attempts=event.delivery_attempts,
+                user_id=event.user_id,
+                idempotency_key=event.idempotency_key,
                 message="Event retrieved successfully"
             )
             for event in pending_events

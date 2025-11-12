@@ -74,6 +74,14 @@ class EventResponse(BaseModel):
         ...,
         description="Number of delivery attempts"
     )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="User ID that created this event"
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        description="Client-provided idempotency key"
+    )
     message: str = Field(
         ...,
         description="Human-readable status message"

@@ -13,7 +13,7 @@ Author: Triggers API Team
 """
 
 from typing import Dict, Any, Optional
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 class CreateEventRequest(BaseModel):
@@ -48,3 +48,32 @@ class CreateEventRequest(BaseModel):
         default=None,
         description="Optional event metadata"
     )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description="Optional idempotency key to prevent duplicate events"
+    )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="Optional user ID (will be populated from auth context when enabled)"
+    )
+
+    @field_validator('idempotency_key')
+    @classmethod
+    def validate_idempotency_key(cls, v: Optional[str]) -> Optional[str]:
+        """Validate idempotency key format if provided."""
+        if v is None:
+            return v
+
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("idempotency_key must be a non-empty string")
+
+        # Allow alphanumeric characters, hyphens, underscores, dots, and colons
+        # This supports common patterns like "order-12345-2024-01-15" or UUIDs
+        import re
+        if not re.match(r'^[a-zA-Z0-9._:-]+$', v):
+            raise ValueError(
+                "idempotency_key must contain only letters, numbers, dots, underscores, hyphens, and colons"
+            )
+
+        return v.strip()
