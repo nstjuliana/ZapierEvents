@@ -94,6 +94,13 @@ class DynamoDBClient:
             if item.get('delivered_at') and item['delivered_at'] is not None:
                 item['delivered_at'] = item['delivered_at'].isoformat()
 
+            # Serialize payload and metadata as JSON strings to preserve types
+            # This ensures numbers, booleans, etc. are preserved correctly
+            if 'payload' in item:
+                item['payload'] = json.dumps(item['payload'])
+            if 'metadata' in item and item.get('metadata') is not None:
+                item['metadata'] = json.dumps(item['metadata'])
+
             # Store in DynamoDB
             self.table.put_item(Item=item)
 
@@ -156,6 +163,15 @@ class DynamoDBClient:
                 return None
 
             item = response['Item']
+
+            # Deserialize payload and metadata from JSON strings to preserve types
+            # Handle both new format (JSON string) and old format (dict) for backward compatibility
+            if 'payload' in item:
+                if isinstance(item['payload'], str):
+                    item['payload'] = json.loads(item['payload'])
+            if 'metadata' in item and item.get('metadata') is not None:
+                if isinstance(item['metadata'], str):
+                    item['metadata'] = json.loads(item['metadata'])
 
             # Convert ISO strings back to datetime objects
             if 'created_at' in item:
@@ -249,6 +265,15 @@ class DynamoDBClient:
             # Convert items to Event objects
             events = []
             for item in response.get('Items', []):
+                # Deserialize payload and metadata from JSON strings to preserve types
+                # Handle both new format (JSON string) and old format (dict) for backward compatibility
+                if 'payload' in item:
+                    if isinstance(item['payload'], str):
+                        item['payload'] = json.loads(item['payload'])
+                if 'metadata' in item and item.get('metadata') is not None:
+                    if isinstance(item['metadata'], str):
+                        item['metadata'] = json.loads(item['metadata'])
+
                 # Convert ISO strings back to datetime objects
                 if 'created_at' in item:
                     item['created_at'] = datetime.fromisoformat(item['created_at'])
@@ -327,6 +352,13 @@ class DynamoDBClient:
             item['created_at'] = item['created_at'].isoformat()
             if item.get('delivered_at') and item['delivered_at'] is not None:
                 item['delivered_at'] = item['delivered_at'].isoformat()
+
+            # Serialize payload and metadata as JSON strings to preserve types
+            # This ensures numbers, booleans, etc. are preserved correctly
+            if 'payload' in item:
+                item['payload'] = json.dumps(item['payload'])
+            if 'metadata' in item and item.get('metadata') is not None:
+                item['metadata'] = json.dumps(item['metadata'])
 
             # Update in DynamoDB (put_item will replace the entire item)
             self.table.put_item(Item=item)

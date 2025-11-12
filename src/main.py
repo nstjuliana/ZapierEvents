@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 app = FastAPI(
     title="Zapier Triggers API",
     description="Event ingestion and delivery API for real-time automation",
-    version="0.1.0",
+    version=settings.app_version,
     docs_url="/docs",  # Swagger UI
     redoc_url="/redoc"  # ReDoc
 )

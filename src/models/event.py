@@ -100,16 +100,17 @@ class Event(BaseModel):
 
         return v
 
-    @field_validator('payload')
+    @field_validator('payload', mode='before')
     @classmethod
-    def validate_payload(cls, v: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate payload is a non-empty dictionary."""
+    def validate_payload(cls, v: Any) -> Dict[str, Any]:
+        """Validate payload is a non-empty dictionary, preserving all JSON types."""
         if not isinstance(v, dict):
             raise ValueError("payload must be a dictionary")
 
         if not v:
             raise ValueError("payload cannot be empty")
 
+        # Return as-is to preserve all JSON types (numbers, strings, booleans, etc.)
         return v
 
     def mark_delivered(self) -> None:
