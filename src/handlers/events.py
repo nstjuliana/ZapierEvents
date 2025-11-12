@@ -212,10 +212,10 @@ async def create_event(
                     delivery_attempts=existing_event.delivery_attempts,
                     user_id=existing_event.user_id,
                     idempotency_key=existing_event.idempotency_key,
-                    message="Event already exists with this idempotency key"
+                    message="Event already exists with this user_id and idempotency key"
                 )
                 return JSONResponse(
-                    content=response_data.model_dump(),
+                    content=response_data.model_dump(mode='json'),
                     status_code=status_codes.HTTP_200_OK
                 )
 
