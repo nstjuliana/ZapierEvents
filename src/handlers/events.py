@@ -21,10 +21,10 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi import status as status_codes
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from typing import List, Optional, Union
 
-from models.request import CreateEventRequest
+from models.request import CreateEventRequest, UpdateEventRequest
 from models.response import EventResponse
 from models.event import Event
 from storage.dynamodb import DynamoDBClient
@@ -492,6 +492,285 @@ async def list_events(
         )
         for event in events
     ]
+
+
+@router.patch("/{event_id}", response_model=EventResponse)
+async def update_event(
+    event_id: str,
+    request: UpdateEventRequest,
+    http_request: Request,
+    db_client: DynamoDBClient = Depends(get_db_client),
+    sqs_client: SQSClient = Depends(get_sqs_client)
+) -> EventResponse:
+    """
+    Update an event's payload, metadata, and/or idempotency_key.
+
+    Updates only the provided fields (payload, metadata, and/or idempotency_key).
+    For delivered/replayed events, resets status to "pending" and queues for redelivery.
+    
+    To remove idempotency_key, set it to null in the request.
+
+    Args:
+        event_id: Unique event identifier
+        request: UpdateEventRequest containing fields to update
+        http_request: FastAPI Request object for authorization context
+        db_client: DynamoDB client (injected via dependency)
+        sqs_client: SQS client for queuing redelivery
+
+    Returns:
+        EventResponse with updated event details
+
+    Raises:
+        HTTPException: 400 if no fields provided or invalid data, 403 if user not authorized, 
+                       404 if event not found, 500 if database error
+
+    Example:
+        # Update payload and metadata
+        PATCH /events/evt_abc123xyz456
+        {
+            "payload": {"order_id": "12345", "amount": 150.00},
+            "metadata": {"updated": true}
+        }
+
+        # Add or update idempotency_key
+        PATCH /events/evt_abc123xyz456
+        {
+            "idempotency_key": "order-12345-2024-01-15"
+        }
+
+        # Remove idempotency_key
+        PATCH /events/evt_abc123xyz456
+        {
+            "idempotency_key": null
+        }
+
+        Response (200):
+        {
+            "event_id": "evt_abc123xyz456",
+            "status": "pending",
+            "created_at": "2024-01-15T10:30:01Z",
+            "idempotency_key": "order-12345-2024-01-15",
+            "message": "Event updated and queued for redelivery"
+        }
+    """
+    try:
+        # Get user_id from authorizer context
+        user_id = get_user_id_from_request(http_request)
+
+        # Fetch existing event
+        event = await db_client.get_event(event_id)
+        if not event:
+            raise HTTPException(
+                status_code=status_codes.HTTP_404_NOT_FOUND,
+                detail=f"Event {event_id} not found"
+            )
+
+        # Verify ownership (only check if auth is enabled and user_id is set)
+        if user_id is not None and event.user_id != user_id:
+            logger.warning(
+                "Unauthorized event update attempt",
+                event_id=event_id,
+                requested_by=user_id,
+                event_owner=event.user_id
+            )
+            raise HTTPException(
+                status_code=status_codes.HTTP_403_FORBIDDEN,
+                detail="You can only update your own events"
+            )
+
+        # Check which fields were explicitly provided in the request
+        # This allows us to distinguish between "not provided" and "explicitly set to None"
+        provided_fields = request.model_dump(exclude_unset=True)
+        
+        # Validate that at least one field was provided
+        if not provided_fields:
+            raise HTTPException(
+                status_code=status_codes.HTTP_400_BAD_REQUEST,
+                detail="At least one of payload, metadata, or idempotency_key must be provided"
+            )
+
+        # Update the provided fields
+        updated_fields = []
+        if 'payload' in provided_fields:
+            if request.payload is not None:
+                event.payload = request.payload
+                updated_fields.append("payload")
+            else:
+                raise HTTPException(
+                    status_code=status_codes.HTTP_400_BAD_REQUEST,
+                    detail="payload cannot be null"
+                )
+        
+        if 'metadata' in provided_fields:
+            # metadata can be set to None to remove it
+            event.metadata = request.metadata
+            updated_fields.append("metadata")
+        
+        if 'idempotency_key' in provided_fields:
+            # idempotency_key can be set to None to remove it
+            event.idempotency_key = request.idempotency_key
+            if request.idempotency_key is None:
+                updated_fields.append("idempotency_key (removed)")
+            else:
+                updated_fields.append("idempotency_key")
+
+        # Smart status handling for redelivery
+        previous_status = event.status
+        should_redeliver = event.status in ["delivered", "replayed"]
+        if should_redeliver:
+            # Reset to pending for redelivery
+            event.status = "pending"
+            event.delivered_at = None
+
+            logger.info(
+                "Event updated and reset for redelivery",
+                event_id=event_id,
+                previous_status=previous_status,
+                updated_fields=updated_fields
+            )
+
+            # Queue to SQS for immediate redelivery
+            try:
+                await sqs_client.send_message(
+                    event_id=event_id,
+                    event_data=event.model_dump(mode='json')
+                )
+                logger.info("Updated event queued for redelivery", event_id=event_id)
+            except Exception as queue_error:
+                logger.error(
+                    "Failed to queue updated event for redelivery",
+                    event_id=event_id,
+                    error=str(queue_error)
+                )
+                # Don't fail the update, just log the error
+        else:
+            logger.info(
+                "Event updated without status change",
+                event_id=event_id,
+                status=event.status,
+                updated_fields=updated_fields
+            )
+
+        # Save updated event
+        await db_client.update_event(event)
+
+        message = "Event updated"
+        if should_redeliver:
+            message += " and queued for redelivery"
+        else:
+            message += " successfully"
+
+        return EventResponse(
+            event_id=event.event_id,
+            event_type=event.event_type,
+            payload=event.payload,
+            metadata=event.metadata,
+            status=event.status,
+            created_at=event.created_at,
+            delivered_at=event.delivered_at,
+            delivery_attempts=event.delivery_attempts,
+            user_id=event.user_id,
+            idempotency_key=event.idempotency_key,
+            message=message
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to update event",
+            event_id=event_id,
+            error=str(e)
+        )
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update event"
+        )
+
+
+@router.delete("/{event_id}")
+async def delete_event(
+    event_id: str,
+    http_request: Request,
+    db_client: DynamoDBClient = Depends(get_db_client)
+) -> Response:
+    """
+    Delete an event.
+
+    Permanently removes an event from the system.
+    Only the event owner can delete their events.
+    Idempotent: returns 204 if event already deleted.
+
+    Args:
+        event_id: Unique event identifier to delete
+        http_request: FastAPI Request object for authorization context
+        db_client: DynamoDB client (injected via dependency)
+
+    Returns:
+        Response: 200 OK if deleted, 204 No Content if already deleted (idempotent)
+
+    Raises:
+        HTTPException: 403 if user not authorized, 500 if database error
+
+    Example:
+        DELETE /events/evt_abc123xyz456
+
+        Response (200): Event deleted successfully
+        Response (204): Event already deleted (idempotent)
+    """
+    try:
+        # Get user_id from authorizer context
+        user_id = get_user_id_from_request(http_request)
+
+        # Fetch existing event
+        event = await db_client.get_event(event_id)
+        if not event:
+            # Event doesn't exist - idempotent delete (already deleted)
+            logger.info(
+                "Delete requested for non-existent event (idempotent)",
+                event_id=event_id,
+                requested_by=user_id
+            )
+            return Response(status_code=status_codes.HTTP_204_NO_CONTENT)
+
+        # Verify ownership (only check if auth is enabled and user_id is set)
+        if user_id is not None and event.user_id != user_id:
+            logger.warning(
+                "Unauthorized event delete attempt",
+                event_id=event_id,
+                requested_by=user_id,
+                event_owner=event.user_id
+            )
+            raise HTTPException(
+                status_code=status_codes.HTTP_403_FORBIDDEN,
+                detail="You can only delete your own events"
+            )
+
+        # Delete the event
+        await db_client.delete_event(event_id)
+
+        logger.info(
+            "Event deleted successfully",
+            event_id=event_id,
+            event_type=event.event_type,
+            deleted_by=user_id
+        )
+
+        # Return 200 OK for successful deletion
+        return Response(status_code=status_codes.HTTP_200_OK)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to delete event",
+            event_id=event_id,
+            error=str(e)
+        )
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete event"
+        )
 
 
 @router.post("/{event_id}/acknowledge", status_code=status_codes.HTTP_204_NO_CONTENT)

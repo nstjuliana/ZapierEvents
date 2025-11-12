@@ -448,6 +448,50 @@ class DynamoDBClient:
             )
             raise
 
+    async def delete_event(self, event_id: str) -> None:
+        """
+        Delete an event from DynamoDB.
+
+        Removes an event from the DynamoDB table by its event_id.
+
+        Args:
+            event_id: Unique event identifier to delete
+
+        Raises:
+            ClientError: If DynamoDB operation fails
+            ValueError: If event_id is invalid
+        """
+        if not event_id or not isinstance(event_id, str):
+            raise ValueError("event_id must be a non-empty string")
+
+        try:
+            self.table.delete_item(Key={'event_id': event_id})
+
+            logger.info(
+                "Event deleted from DynamoDB",
+                event_id=event_id,
+                table_name=self.table_name
+            )
+
+        except ClientError as e:
+            logger.error(
+                "Failed to delete event from DynamoDB",
+                event_id=event_id,
+                table_name=self.table_name,
+                error_code=e.response['Error']['Code'],
+                error_message=e.response['Error']['Message']
+            )
+            raise
+
+        except Exception as e:
+            logger.error(
+                "Unexpected error deleting event from DynamoDB",
+                event_id=event_id,
+                table_name=self.table_name,
+                error=str(e)
+            )
+            raise
+
     async def update_event(self, event: Event) -> None:
         """
         Update an existing event in DynamoDB.

@@ -47,6 +47,8 @@ Resources:
         AllowMethods:
           - GET
           - POST
+          - PATCH
+          - DELETE
         AllowHeaders:
           - "*"
 
@@ -108,6 +110,18 @@ Resources:
             ApiId: !Ref TriggersApi
             Path: /events/{id}/acknowledge
             Method: POST
+        UpdateEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events/{id}
+            Method: PATCH
+        DeleteEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events/{id}
+            Method: DELETE
 
   # SQS polling Lambda worker
   DeliveryWorkerFunction:

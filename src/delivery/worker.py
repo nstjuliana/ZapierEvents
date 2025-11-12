@@ -154,6 +154,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             logger.info("Processing event from SQS", event_id=event_obj.event_id)
 
+            # Check if event still exists in DynamoDB (may have been deleted)
+            db_event = db_client.get_event(event_obj.event_id)
+            if not db_event:
+                logger.info(
+                    "Event no longer exists in DynamoDB, skipping delivery",
+                    event_id=event_obj.event_id,
+                    reason="event_deleted"
+                )
+                # Don't report as failure - orphaned messages are acceptable
+                continue
+
+            # Use the current event data from DynamoDB for delivery
+            event_obj = db_event
+
             # Attempt delivery
             success = delivery_client.deliver_event(event_obj)
 
