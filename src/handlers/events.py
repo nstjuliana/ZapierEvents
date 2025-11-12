@@ -33,6 +33,7 @@ from delivery.push import PushDeliveryClient
 from config.settings import settings
 from utils.logger import get_logger
 from utils.metrics import MetricsClient
+from utils.filters import parse_filter_params
 
 router = APIRouter(prefix="/events", tags=["events"])
 logger = get_logger(__name__)
@@ -419,21 +420,26 @@ async def get_event(
 
 @router.get("", response_model=List[EventResponse])
 async def list_events(
+    request: Request,
     status: Optional[str] = None,
     limit: int = 50,
     cursor: Optional[str] = None,
     db_client: DynamoDBClient = Depends(get_db_client)
 ) -> List[EventResponse]:
     """
-    List events with optional filtering and pagination.
+    List events with advanced filtering and pagination.
 
-    Returns a paginated list of events, optionally filtered by status.
-    Uses cursor-based pagination for efficient handling of large datasets.
+    Returns a paginated list of events with support for complex filtering by
+    payload fields, metadata, dates, and various comparison operators.
+
+    Supports filtering operators: eq (default), gt, gte, lt, lte, ne, contains, startswith
+    Special date filters: created_after, created_before, delivered_after, delivered_before
 
     Args:
+        request: FastAPI Request object for accessing all query parameters
         status: Optional status filter (pending, delivered, failed, replayed)
         limit: Maximum number of events to return (default 50, max 100)
-        cursor: Pagination cursor from previous response
+        cursor: Pagination cursor from previous response (not supported with custom filters)
         db_client: DynamoDB client (injected via dependency)
 
     Returns:
@@ -443,16 +449,22 @@ async def list_events(
         HTTPException: 400 if invalid parameters
         HTTPException: 500 if database error
 
-    Example:
+    Examples:
         GET /events?status=pending&limit=10
+
+        GET /events?payload.order_id=12345
+
+        GET /events?metadata.source=ecommerce&payload.amount[gte]=100
+
+        GET /events?created_after=2024-01-15T00:00:00Z&payload.customer.email[contains]=gmail
 
         Response (200):
         [
             {
                 "event_id": "evt_abc123xyz456",
-                "status": "pending",
+                "status": "delivered",
                 "created_at": "2024-01-15T10:30:01Z",
-                "delivered_at": null,
+                "delivered_at": "2024-01-15T10:30:02Z",
                 "message": "Event retrieved successfully"
             }
         ]
@@ -463,14 +475,19 @@ async def list_events(
             detail="Limit cannot exceed 100"
         )
 
+    # Parse filter parameters from query string
+    query_params = dict(request.query_params)
+    filters = parse_filter_params(query_params)
+
     try:
         events = await db_client.list_events(
             status=status,
             limit=limit,
-            cursor=cursor
+            cursor=cursor,
+            filters=filters
         )
     except Exception as e:
-        logger.error("Database error listing events", error=str(e))
+        logger.error("Database error listing events", error=str(e), filters=bool(filters))
         raise HTTPException(
             status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to list events"

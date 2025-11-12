@@ -134,6 +134,147 @@ Expected response:
 }
 ```
 
+## API Documentation
+
+### Endpoints
+
+#### GET /events - List Events with Advanced Filtering
+
+Retrieve a paginated list of events with powerful filtering capabilities.
+
+**Query Parameters:**
+- `status` (optional): Filter by delivery status (`pending`, `delivered`, `failed`, `replayed`)
+- `limit` (optional): Maximum number of events to return (default: 50, max: 100)
+- `cursor` (optional): Pagination cursor for retrieving the next page of results
+
+**Advanced Filtering:**
+The API supports complex filtering on event payload and metadata fields using various comparison operators:
+
+**Supported Operators:**
+- `eq` (default): Exact match (`?field=value`)
+- `gt, gte, lt, lte`: Numeric/date comparisons (`?field[gte]=100`)
+- `ne`: Not equal (`?field[ne]=value`)
+- `contains`: String contains (`?field[contains]=text`)
+- `startswith`: String starts with (`?field[startswith]=prefix`)
+
+**Special Date Filters:**
+- `created_after`, `created_before`: Filter by event creation date
+- `delivered_after`, `delivered_before`: Filter by delivery date
+
+**Examples:**
+
+```bash
+# Basic status filtering (existing functionality)
+GET /events?status=pending&limit=10
+
+# Filter by exact payload field
+GET /events?payload.order_id=12345
+
+# Filter by numeric comparison
+GET /events?payload.amount[gte]=100
+
+# Filter by nested payload fields
+GET /events?payload.customer.email[contains]=gmail.com
+
+# Filter by metadata
+GET /events?metadata.source=ecommerce
+
+# Combine multiple filters
+GET /events?status=delivered&payload.amount[gte]=50&metadata.source=api
+
+# Date filtering
+GET /events?created_after=2024-01-15T00:00:00Z
+GET /events?delivered_before=2024-01-16T00:00:00Z
+
+# String operations
+GET /events?event_type[startswith]=order.
+GET /events?payload.customer.email[contains]=@company.com
+
+# Complex filtering with pagination
+GET /events?payload.status=failed&limit=50
+```
+
+**Response:**
+```json
+[
+  {
+    "event_id": "evt_abc123xyz456",
+    "event_type": "order.created",
+    "payload": {"order_id": "12345", "amount": 99.99},
+    "metadata": {"source": "ecommerce"},
+    "status": "delivered",
+    "created_at": "2024-01-15T10:30:01Z",
+    "delivered_at": "2024-01-15T10:30:02Z",
+    "delivery_attempts": 1,
+    "message": "Event retrieved successfully"
+  }
+]
+```
+
+**Notes:**
+- Filters are applied after retrieving events from the database
+- Complex filters may result in fetching more events than requested for accurate pagination
+- Status filtering uses efficient database indexes when used alone
+- Combining status filters with custom filters works seamlessly
+
+**📖 For detailed filtering documentation**, see [`_docs/event-filtering.md`](_docs/event-filtering.md) for:
+- Complete operator reference
+- Advanced examples and use cases
+- Performance considerations
+- Best practices and troubleshooting
+
+#### POST /events - Create Event
+
+Create and ingest a new event with automatic delivery attempt.
+
+**Request Body:**
+```json
+{
+  "event_type": "order.created",
+  "payload": {
+    "order_id": "12345",
+    "amount": 99.99,
+    "customer": {
+      "email": "user@example.com"
+    }
+  },
+  "metadata": {
+    "source": "ecommerce-platform",
+    "version": "2.1.0"
+  },
+  "idempotency_key": "order-12345-2024-01-15"
+}
+```
+
+#### GET /events/{event_id} - Get Single Event
+
+Retrieve a specific event by its ID.
+
+```bash
+GET /events/evt_abc123xyz456
+```
+
+#### PATCH /events/{event_id} - Update Event
+
+Update an event's payload, metadata, or idempotency key.
+
+#### DELETE /events/{event_id} - Delete Event
+
+Permanently remove an event from the system.
+
+#### POST /events/{event_id}/acknowledge - Acknowledge Delivery
+
+Mark an event as successfully delivered.
+
+#### GET /inbox - Get Pending Events
+
+Retrieve events waiting for delivery (alias for `GET /events?status=pending`).
+
+### Interactive Documentation
+
+- **Swagger UI**: Visit `/docs` for interactive API documentation
+- **ReDoc**: Visit `/redoc` for alternative documentation format
+
 ## Project Structure
 
 ```

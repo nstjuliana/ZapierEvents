@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     # Application settings
     app_name: str = Field(default="Zapier Triggers API", description="Application name")
-    app_version: str = Field(default="0.2.3", description="Application version")
+    app_version: str = Field(default="0.2.4", description="Application version")
     log_level: str = Field(default="INFO", description="Logging level")
 
     # AWS settings

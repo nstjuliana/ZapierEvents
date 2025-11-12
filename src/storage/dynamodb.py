@@ -17,13 +17,14 @@ Author: Triggers API Team
 
 import boto3
 from botocore.exceptions import ClientError
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime, timezone
 import base64
 import json
 
 from models.event import Event
 from utils.logger import get_logger
+from utils.filters import EventFilter, build_dynamodb_filter, apply_filters_to_events
 
 logger = get_logger(__name__)
 
@@ -336,19 +337,22 @@ class DynamoDBClient:
         self,
         status: Optional[str] = None,
         limit: int = 50,
-        cursor: Optional[str] = None
+        cursor: Optional[str] = None,
+        filters: Optional[Dict[str, EventFilter]] = None
     ) -> List[Event]:
         """
-        List events with optional status filter and pagination.
+        List events with optional status filter, custom filters, and pagination.
 
         Uses cursor-based pagination with DynamoDB LastEvaluatedKey.
         When status is provided, queries the StatusIndex GSI for efficient filtering.
-        When no status filter, scans the table (less efficient but necessary).
+        When custom filters are provided, applies them after retrieving data.
+        When no filters, scans the table (less efficient but necessary).
 
         Args:
             status: Optional status to filter by (pending, delivered, failed, replayed)
             limit: Maximum number of events to return (default 50)
             cursor: Base64-encoded pagination cursor from previous response
+            filters: Optional dictionary of EventFilter objects for custom filtering
 
         Returns:
             List of Event objects sorted by created_at descending
@@ -370,6 +374,15 @@ class DynamoDBClient:
                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
                     logger.warning("Invalid pagination cursor", cursor=cursor, error=str(e))
                     raise ValueError("Invalid pagination cursor")
+
+            # Check if we have any JSON-based filters that require in-memory filtering
+            has_json_filters = any(f.field_type == 'json' for f in (filters or {}).values())
+
+            # If we have JSON filters, we need to potentially fetch more data since filtering happens after retrieval
+            if has_json_filters:
+                # Increase limit to account for filtered-out events, but cap at a reasonable maximum
+                fetch_limit = min(limit * 3, 300)  # Fetch up to 3x requested limit, max 300
+                kwargs['Limit'] = fetch_limit
 
             # Query by status using GSI or scan all
             if status:
@@ -408,9 +421,18 @@ class DynamoDBClient:
             if not status:
                 events.sort(key=lambda e: e.created_at, reverse=True)
 
+            # Apply custom filters if provided
+            if filters:
+                events = apply_filters_to_events(events, filters)
+
+                # Limit to requested number after filtering
+                events = events[:limit]
+
             # Create next cursor if more results available
+            # Note: This is simplified - proper cursor handling with filters would be more complex
+            # For now, we don't support cursors with custom filters
             next_cursor = None
-            if 'LastEvaluatedKey' in response:
+            if not filters and 'LastEvaluatedKey' in response:
                 try:
                     next_cursor = base64.b64encode(
                         json.dumps(response['LastEvaluatedKey']).encode('utf-8')
@@ -422,6 +444,7 @@ class DynamoDBClient:
                 "Events listed",
                 count=len(events),
                 status_filter=status,
+                custom_filters=bool(filters),
                 limit=limit,
                 has_more=bool(next_cursor),
                 table_name=self.table_name
@@ -433,6 +456,7 @@ class DynamoDBClient:
             logger.error(
                 "Failed to list events from DynamoDB",
                 status_filter=status,
+                custom_filters=bool(filters),
                 table_name=self.table_name,
                 error_code=e.response['Error']['Code'],
                 error_message=e.response['Error']['Message']
@@ -443,6 +467,7 @@ class DynamoDBClient:
             logger.error(
                 "Unexpected error listing events from DynamoDB",
                 status_filter=status,
+                custom_filters=bool(filters),
                 table_name=self.table_name,
                 error=str(e)
             )
