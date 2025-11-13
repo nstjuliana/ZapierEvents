@@ -362,3 +362,128 @@ class BatchDeleteResponse(BaseModel):
         ...,
         description="Summary statistics for the entire batch"
     )
+
+
+class ReplayResponse(BaseModel):
+    """
+    Response model for single event replay operations.
+
+    Returns the replay status along with event details and delivery information.
+    Based on EventResponse structure but focused on replay-specific information.
+
+    Attributes:
+        event_id: Unique event identifier
+        status: Current replay status (replayed, pending, failed)
+        created_at: Original event creation timestamp
+        delivered_at: When replay was delivered (nullable)
+        delivery_attempts: Total number of delivery attempts including replay
+        message: Human-readable status message
+    """
+
+    model_config = ConfigDict(
+        json_encoders={
+            datetime: lambda v: v.isoformat() + 'Z'
+        }
+    )
+
+    event_id: str = Field(
+        ...,
+        description="Unique event identifier"
+    )
+    status: str = Field(
+        ...,
+        description="Replay status (replayed, pending, failed)"
+    )
+    created_at: datetime = Field(
+        ...,
+        description="Original event creation timestamp"
+    )
+    delivered_at: Optional[datetime] = Field(
+        default=None,
+        description="When replay was delivered (nullable)"
+    )
+    delivery_attempts: int = Field(
+        ...,
+        description="Total number of delivery attempts including replay"
+    )
+    message: str = Field(
+        ...,
+        description="Human-readable status message"
+    )
+
+
+class BatchReplayItemResult(BaseModel):
+    """
+    Result for a single item in batch replay operation.
+
+    Contains either success information or error details.
+    Index corresponds to position in original request array.
+
+    Attributes:
+        index: Position in the original request array (0-based)
+        success: Whether this item was replayed successfully
+        event_id: The event ID that was replayed
+        status: Replay status (replayed, pending, failed)
+        message: Success message or error information
+        error: Error information (only present if success=False)
+    """
+
+    model_config = ConfigDict(
+        json_encoders={
+            datetime: lambda v: v.isoformat() + 'Z'
+        }
+    )
+
+    index: int = Field(
+        ...,
+        ge=0,
+        description="Position in the original request array (0-based)"
+    )
+    success: bool = Field(
+        ...,
+        description="Whether this item was replayed successfully"
+    )
+    event_id: str = Field(
+        ...,
+        description="The event ID that was replayed"
+    )
+    status: str = Field(
+        ...,
+        description="Replay status (replayed, pending, failed)"
+    )
+    message: str = Field(
+        ...,
+        description="Success message or error information"
+    )
+    error: Optional[BatchItemError] = Field(
+        default=None,
+        description="Error information (only present if success=False)"
+    )
+
+
+class BatchReplayResponse(BaseModel):
+    """
+    Response for batch replay operations.
+
+    Contains detailed results for each item plus summary statistics.
+    Supports partial success - some items may succeed while others fail.
+
+    Attributes:
+        results: List of individual replay results
+        summary: Summary statistics for the entire batch
+    """
+
+    model_config = ConfigDict(
+        json_encoders={
+            datetime: lambda v: v.isoformat() + 'Z'
+        }
+    )
+
+    results: List[BatchReplayItemResult] = Field(
+        ...,
+        description="List of individual replay results"
+    )
+    summary: BatchOperationSummary = Field(
+        ...,
+        description="Summary statistics for the entire batch"
+    )

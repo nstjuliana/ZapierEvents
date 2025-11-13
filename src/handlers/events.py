@@ -24,8 +24,8 @@ from fastapi import status as status_codes
 from fastapi.responses import JSONResponse, Response
 from typing import Dict, List, Optional, Union
 
-from models.request import CreateEventRequest, UpdateEventRequest, BatchCreateEventRequest, BatchUpdateEventRequest, BatchDeleteEventRequest
-from models.response import EventResponse, BatchCreateResponse, BatchUpdateResponse, BatchDeleteResponse, BatchCreateItemResult, BatchUpdateItemResult, BatchDeleteItemResult, BatchItemError, BatchOperationSummary
+from models.request import CreateEventRequest, UpdateEventRequest, BatchCreateEventRequest, BatchUpdateEventRequest, BatchDeleteEventRequest, ReplayEventRequest, BatchReplayEventRequest
+from models.response import EventResponse, BatchCreateResponse, BatchUpdateResponse, BatchDeleteResponse, BatchCreateItemResult, BatchUpdateItemResult, BatchDeleteItemResult, BatchItemError, BatchOperationSummary, ReplayResponse, BatchReplayItemResult, BatchReplayResponse
 from models.event import Event
 from storage.dynamodb import DynamoDBClient
 from sqs_queue.sqs import SQSClient
@@ -2034,3 +2034,468 @@ async def acknowledge_event(
             detail="Failed to acknowledge event"
         )
 
+
+# Create a separate router for replay endpoints
+replay_router = APIRouter(prefix="/replay", tags=["replay"])
+
+@replay_router.post("/batch", response_model=BatchReplayResponse)
+async def batch_replay_events(
+    http_request: Request,
+    request: BatchReplayEventRequest = BatchReplayEventRequest(),
+    db_client: DynamoDBClient = Depends(get_db_client),
+    delivery_client: PushDeliveryClient = Depends(get_delivery_client),
+    sqs_client: SQSClient = Depends(get_sqs_client)
+) -> BatchReplayResponse:
+    """
+    Replay multiple events in a single batch operation.
+    
+    Supports two modes:
+    1. List mode: Provide event_ids in request body
+    2. Filter mode: Use query parameters to filter events
+    
+    Processes event replays with best-effort semantics - continues processing
+    even if some replays fail. Enforces ownership checks for security.
+    
+    Args:
+        request: BatchReplayEventRequest containing list of event IDs and replay params
+        http_request: FastAPI Request object for query params and authorization context
+        db_client: DynamoDB client (injected via dependency)
+        delivery_client: Push delivery client (injected via dependency)
+        sqs_client: SQS client (injected via dependency)
+        
+    Returns:
+        BatchReplayResponse with detailed per-item results and summary
+        
+    Raises:
+        HTTPException: 400 if batch validation fails
+        HTTPException: 500 if critical system error occurs
+        
+    Example (List Mode):
+        POST /replay/batch
+        {
+          "event_ids": ["evt_abc123xyz456", "evt_def789uvw012"]
+        }
+        
+    Example (Filter Mode):
+        POST /replay/batch?status=failed&payload.error_type=timeout
+        
+    Example (Combined Mode - union of filters and body):
+        POST /replay/batch?status=failed
+        {
+          "event_ids": ["evt_abc123xyz456"]
+        }
+    """
+    try:
+        # Get user_id from auth context
+        user_id = get_user_id_from_request(http_request)
+        
+        # Parse query parameters for filter mode
+        query_params = dict(http_request.query_params)
+        filters = parse_filter_params(query_params)
+        has_filters = bool(filters) or 'status' in query_params
+        
+        # Collect event IDs from both filters and request body
+        event_ids_set = set()
+        
+        if has_filters:
+            # Filter mode: Get matching events
+            logger.info(
+                "Starting filtered batch replay",
+                filters=bool(filters),
+                status_filter=query_params.get('status'),
+                has_body_event_ids=request.event_ids is not None,
+                user_id=user_id
+            )
+            
+            # Get matching events (up to 100)
+            matching_events = await db_client.list_events(
+                status=query_params.get('status'),
+                limit=100,
+                cursor=None,
+                filters=filters
+            )
+            
+            logger.info(
+                "list_events returned results for filtered batch replay",
+                count=len(matching_events),
+                event_ids=[e.event_id for e in matching_events] if matching_events else []
+            )
+            
+            # Add filtered event IDs to the set, filtering by user_id for ownership
+            for event in matching_events:
+                # Skip events that don't belong to this user (if auth is enabled)
+                if user_id is not None and event.user_id != user_id:
+                    logger.debug(
+                        "Skipping event from different user in filtered batch replay",
+                        event_id=event.event_id,
+                        event_user=event.user_id,
+                        requested_by=user_id
+                    )
+                    continue
+                
+                # Defensive check: skip events with missing critical fields
+                if not event.event_id or not hasattr(event, 'payload'):
+                    logger.warning(
+                        "Skipping malformed event in filtered batch replay",
+                        event_id=getattr(event, 'event_id', 'UNKNOWN'),
+                        has_payload=hasattr(event, 'payload')
+                    )
+                    continue
+                    
+                event_ids_set.add(event.event_id)
+                logger.debug(
+                    "Added event to filtered batch replay",
+                    event_id=event.event_id,
+                    event_type=getattr(event, 'event_type', 'UNKNOWN')
+                )
+            
+            logger.info(
+                "Filtered batch replay found matching events",
+                matched_count=len(event_ids_set)
+            )
+        
+        # Add event IDs from request body if provided (union with filtered results)
+        if request.event_ids:
+            event_ids_set.update(request.event_ids)
+            logger.info(
+                "Combined filter results with body event_ids",
+                total_count=len(event_ids_set)
+            )
+        
+        # Check if we have any event IDs to replay
+        if not event_ids_set:
+            if has_filters:
+                # No events matched the filter
+                logger.info("No events matched the filter criteria for replay")
+                return BatchReplayResponse(
+                    results=[],
+                    summary=BatchOperationSummary(
+                        total=0,
+                        successful=0,
+                        idempotent=0,
+                        failed=0
+                    )
+                )
+            else:
+                # No event IDs provided and no filters
+                raise HTTPException(
+                    status_code=status_codes.HTTP_400_BAD_REQUEST,
+                    detail="Either provide event_ids or use query parameters to filter events"
+                )
+        
+        # Convert to list and cap at 100
+        event_ids = list(event_ids_set)[:100]
+        
+        if len(event_ids_set) > 100:
+            logger.warning(
+                "Batch replay size exceeded 100, capped",
+                requested=len(event_ids_set),
+                processed=100
+            )
+        
+        logger.info(
+            "Starting batch replay",
+            batch_size=len(event_ids),
+            user_id=user_id
+        )
+        
+        results: List[BatchReplayItemResult] = []
+        
+        # Batch get existing events from DynamoDB
+        existing_events = await db_client.batch_get_events(event_ids)
+        events_by_id = {event.event_id: event for event in existing_events}
+        
+        # Process each replay in the batch
+        successful = 0
+        failed = 0
+        
+        for idx, event_id in enumerate(event_ids):
+            try:
+                # Check if event exists
+                event = events_by_id.get(event_id)
+                if not event:
+                    results.append(BatchReplayItemResult(
+                        index=idx,
+                        success=False,
+                        event_id=event_id,
+                        status="failed",
+                        message="Event not found",
+                        error=BatchItemError(
+                            code="NOT_FOUND",
+                            message="Event not found"
+                        )
+                    ))
+                    failed += 1
+                    continue
+                
+                # Check ownership
+                if user_id is not None and event.user_id != user_id:
+                    results.append(BatchReplayItemResult(
+                        index=idx,
+                        success=False,
+                        event_id=event_id,
+                        status="failed",
+                        message="You can only replay your own events",
+                        error=BatchItemError(
+                            code="FORBIDDEN",
+                            message="You can only replay your own events"
+                        )
+                    ))
+                    failed += 1
+                    continue
+                
+                # Check replay limits
+                if event.delivery_attempts >= 10:
+                    results.append(BatchReplayItemResult(
+                        index=idx,
+                        success=False,
+                        event_id=event_id,
+                        status="failed",
+                        message="Event has exceeded maximum replay attempts (10)",
+                        error=BatchItemError(
+                            code="MAX_ATTEMPTS_EXCEEDED",
+                            message="Event has exceeded maximum replay attempts (10)"
+                        )
+                    ))
+                    failed += 1
+                    continue
+                
+                # Add replay metadata
+                replay_metadata = {
+                    'is_replay': True,
+                    'replayed_at': datetime.now(timezone.utc).isoformat(),
+                    'replay_reason': 'batch_replay',
+                    'original_created_at': event.created_at.isoformat(),
+                    'original_status': event.status
+                }
+                
+                # Merge with existing metadata
+                if event.metadata:
+                    event.metadata.update(replay_metadata)
+                else:
+                    event.metadata = replay_metadata
+                
+                # Attempt immediate delivery
+                delivery_success = await delivery_client.deliver_event(event)
+                
+                if delivery_success:
+                    # Update replay status
+                    event.status = "replayed"
+                    event.delivery_attempts += 1
+                    event.delivered_at = datetime.now(timezone.utc)
+                    await db_client.update_event(event)
+                    
+                    results.append(BatchReplayItemResult(
+                        index=idx,
+                        success=True,
+                        event_id=event_id,
+                        status="replayed",
+                        message="Event replayed successfully"
+                    ))
+                    successful += 1
+                else:
+                    # Queue for retry
+                    event.status = "pending"
+                    event.delivery_attempts += 1
+                    await db_client.update_event(event)
+                    
+                    await sqs_client.send_message(
+                        event_id=event_id,
+                        event_data=event.model_dump(mode='json')
+                    )
+                    
+                    results.append(BatchReplayItemResult(
+                        index=idx,
+                        success=True,
+                        event_id=event_id,
+                        status="pending",
+                        message="Event replay queued for retry"
+                    ))
+                    successful += 1
+                    
+            except Exception as e:
+                logger.error(
+                    "Failed to replay event in batch",
+                    event_id=event_id,
+                    index=idx,
+                    error=str(e)
+                )
+                results.append(BatchReplayItemResult(
+                    index=idx,
+                    success=False,
+                    event_id=event_id,
+                    status="failed",
+                    message=f"Replay failed: {str(e)}",
+                    error=BatchItemError(
+                        code="REPLAY_FAILED",
+                        message=str(e)
+                    )
+                ))
+                failed += 1
+        
+        logger.info(
+            "Batch replay completed",
+            total=len(event_ids),
+            successful=successful,
+            failed=failed,
+            filter_mode=has_filters
+        )
+        
+        return BatchReplayResponse(
+            results=results,
+            summary=BatchOperationSummary(
+                total=len(event_ids),
+                successful=successful,
+                idempotent=0,  # Replays are not idempotent in the same way as creates
+                failed=failed
+            )
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Batch replay operation failed", error=str(e))
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Batch replay operation failed"
+        )
+
+
+
+@replay_router.post("/{event_id}", response_model=ReplayResponse)
+async def replay_event(
+    event_id: str,
+    request: Optional[ReplayEventRequest] = None,
+    db_client: DynamoDBClient = Depends(get_db_client),
+    delivery_client: PushDeliveryClient = Depends(get_delivery_client),
+    sqs_client: SQSClient = Depends(get_sqs_client)
+) -> ReplayResponse:
+    """
+    Replay an existing event.
+    
+    Re-delivers an event while preserving its original identity
+    and timestamp. Adds replay metadata for tracking.
+    
+    Args:
+        event_id: ID of event to replay
+        request: Optional request body with replay parameters (reason, workflow_id)
+        db_client: DynamoDB client
+        delivery_client: Push delivery client
+        sqs_client: SQS client
+        
+    Returns:
+        ReplayResponse with replay status
+        
+    Raises:
+        HTTPException: 404 if event not found
+        HTTPException: 400 if event not replayable
+        HTTPException: 500 if replay fails
+    """
+    try:
+        # Retrieve original event
+        event = await db_client.get_event(event_id)
+        
+        if not event:
+            raise HTTPException(
+                status_code=status_codes.HTTP_404_NOT_FOUND,
+                detail=f"Event {event_id} not found"
+            )
+        
+        # Check if event is replayable (max 10 attempts)
+        if event.delivery_attempts >= 10:
+            raise HTTPException(
+                status_code=status_codes.HTTP_400_BAD_REQUEST,
+                detail="Event has exceeded maximum replay attempts (10)"
+            )
+        
+        # Use defaults if no request body provided
+        if request is None:
+            request = ReplayEventRequest()
+        
+        # Add replay metadata
+        replay_metadata = {
+            'is_replay': True,
+            'replayed_at': datetime.now(timezone.utc).isoformat(),
+            'replay_reason': request.reason,
+            'original_created_at': event.created_at.isoformat(),
+            'original_status': event.status
+        }
+        
+        if request.workflow_id:
+            replay_metadata['target_workflow_id'] = request.workflow_id
+        
+        # Merge with existing metadata
+        if event.metadata:
+            event.metadata.update(replay_metadata)
+        else:
+            event.metadata = replay_metadata
+        
+        logger.info(
+            "Attempting event replay",
+            event_id=event_id,
+            reason=request.reason,
+            workflow_id=request.workflow_id,
+            current_attempts=event.delivery_attempts
+        )
+        
+        # Attempt immediate delivery
+        delivery_success = await delivery_client.deliver_event(event)
+        
+        if delivery_success:
+            # Update replay status
+            event.status = "replayed"
+            event.delivery_attempts += 1
+            event.delivered_at = datetime.now(timezone.utc)
+            await db_client.update_event(event)
+            
+            logger.info(
+                "Event replayed successfully",
+                event_id=event_id,
+                reason=request.reason,
+                workflow_id=request.workflow_id,
+                delivery_attempts=event.delivery_attempts
+            )
+            
+            return ReplayResponse(
+                event_id=event.event_id,
+                status="replayed",
+                created_at=event.created_at,
+                delivered_at=event.delivered_at,
+                delivery_attempts=event.delivery_attempts,
+                message="Event replayed successfully"
+            )
+        else:
+            # Queue for retry
+            event.status = "pending"
+            event.delivery_attempts += 1
+            await db_client.update_event(event)
+            
+            await sqs_client.send_message(
+                event_id=event_id,
+                event_data=event.model_dump(mode='json')
+            )
+            
+            logger.info(
+                "Event replay queued for retry",
+                event_id=event_id,
+                reason=request.reason,
+                delivery_attempts=event.delivery_attempts
+            )
+            
+            return ReplayResponse(
+                event_id=event.event_id,
+                status="pending",
+                created_at=event.created_at,
+                delivered_at=None,
+                delivery_attempts=event.delivery_attempts,
+                message="Event replay queued for retry"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Event replay failed", event_id=event_id, error=str(e))
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Event replay failed"
+        )

@@ -140,6 +140,18 @@ Resources:
             ApiId: !Ref TriggersApi
             Path: /events/batch
             Method: DELETE
+        ReplayEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /replay/{id}
+            Method: POST
+        BatchReplayEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /replay/batch
+            Method: POST
 
   # SQS polling Lambda worker
   DeliveryWorkerFunction:

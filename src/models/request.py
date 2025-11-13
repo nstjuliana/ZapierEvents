@@ -465,3 +465,83 @@ class BatchDeleteEventRequest(BaseModel):
                 raise ValueError(f"invalid event_id format: {event_id}")
 
         return v
+
+
+class ReplayEventRequest(BaseModel):
+    """
+    Request model for replaying a single event.
+
+    Optional request body for single event replay. If not provided,
+    defaults will be used.
+
+    Attributes:
+        reason: Optional reason for replay (default: "manual_replay")
+        workflow_id: Optional target workflow ID override
+    """
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        validate_assignment=True
+    )
+
+    reason: str = Field(
+        default="manual_replay",
+        max_length=255,
+        description="Reason for replay"
+    )
+    workflow_id: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description="Optional target workflow ID override"
+    )
+
+
+class BatchReplayEventRequest(BaseModel):
+    """
+    Request model for batch replaying events.
+
+    Supports two modes:
+    1. List mode: Provide a list of event_ids to replay (traditional batch replay)
+    2. Filter mode: Use query parameters to filter events for replay
+    
+    When using filter mode, event_ids is optional. If provided, it will be combined
+    with the filtered results (union).
+
+    Attributes:
+        event_ids: Optional list of event IDs to replay (max 100 combined with filters)
+    """
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        validate_assignment=True
+    )
+
+    event_ids: Optional[List[str]] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Optional list of event IDs to replay (max 100, combined with filter results)"
+    )
+
+    @field_validator('event_ids')
+    @classmethod
+    def validate_event_ids_list(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        """Validate the event_ids list."""
+        if v is None:
+            return v
+        if not v:
+            raise ValueError("event_ids list cannot be empty if provided")
+        if len(v) > 100:
+            raise ValueError("batch size cannot exceed 100 events")
+
+        # Validate each event_id format
+        for event_id in v:
+            if not isinstance(event_id, str):
+                raise ValueError("all event_ids must be strings")
+            if not event_id.strip():
+                raise ValueError("event_ids cannot be empty strings")
+            import re
+            if not re.match(r'^evt_[a-z0-9]{12}$', event_id):
+                raise ValueError(f"invalid event_id format: {event_id}")
+
+        return v
