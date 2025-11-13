@@ -416,3 +416,413 @@ class TestEventHandlers:
 
                 assert exc_info.value.status_code == 500
                 assert "Failed to acknowledge event" in exc_info.value.detail
+
+
+class TestBatchEventHandlers:
+    """Test cases for batch event handler endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_batch_create_events_all_success(self, db_client, sqs_client, delivery_client, metrics_client):
+        """Test successful batch creation of events."""
+        from src.models.request import BatchCreateEventRequest, CreateEventRequest
+        from src.models.response import BatchCreateResponse, BatchCreateItemResult, BatchOperationSummary
+        from src.handlers.events import batch_create_events
+        from unittest.mock import AsyncMock
+
+        # Create test request
+        events = [
+            CreateEventRequest(
+                event_type="order.created",
+                payload={"order_id": "123", "amount": 99.99},
+                metadata={"source": "test"}
+            ),
+            CreateEventRequest(
+                event_type="order.updated",
+                payload={"order_id": "123", "status": "shipped"}
+            )
+        ]
+        request = BatchCreateEventRequest(events=events)
+
+        # Mock dependencies
+        with patch.object(db_client, 'batch_get_events_by_idempotency_keys', new_callable=AsyncMock, return_value={}) as mock_idempotency:
+            with patch.object(db_client, 'batch_put_events', new_callable=AsyncMock, return_value={
+                "successful_event_ids": ["evt_test123456", "evt_test789012"],
+                "failed_items": []
+            }) as mock_batch_put:
+                with patch.object(delivery_client, 'deliver_event', new_callable=AsyncMock, return_value=True) as mock_deliver:
+                    with patch.object(sqs_client, 'send_message', new_callable=AsyncMock) as mock_sqs:
+                        with patch.object(db_client, 'update_event', new_callable=AsyncMock) as mock_update:
+                            with patch('src.handlers.events.get_user_id_from_request', return_value=None):
+
+                                # Create mock HTTP request
+                                from unittest.mock import MagicMock
+                                http_request = MagicMock()
+
+                                # Call batch create
+                                response = await batch_create_events(
+                                    request, http_request, db_client, sqs_client, delivery_client, metrics_client
+                                )
+
+                                # Assert response type and structure
+                                assert isinstance(response, BatchCreateResponse)
+                                assert len(response.results) == 2
+                                assert all(result.success for result in response.results)
+                                assert all(result.event is not None for result in response.results)
+                                assert all(result.error is None for result in response.results)
+                                assert response.summary.total == 2
+                                assert response.summary.successful == 2
+                                assert response.summary.failed == 0
+
+                                # Verify mocks were called
+                                mock_idempotency.assert_called_once()
+                                mock_batch_put.assert_called_once()
+                                assert mock_deliver.call_count == 2
+                                assert mock_update.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_create_events_partial_failure(self, db_client, sqs_client, delivery_client, metrics_client):
+        """Test batch creation with some events failing."""
+        from src.models.request import BatchCreateEventRequest, CreateEventRequest
+        from src.handlers.events import batch_create_events
+        from unittest.mock import AsyncMock
+
+        # Create test request with one valid, one invalid event
+        events = [
+            CreateEventRequest(
+                event_type="order.created",
+                payload={"order_id": "123"}
+            ),
+            CreateEventRequest(
+                event_type="",  # Invalid - empty event_type
+                payload={"order_id": "456"}
+            )
+        ]
+        request = BatchCreateEventRequest(events=events)
+
+        with patch.object(db_client, 'batch_get_events_by_idempotency_keys', new_callable=AsyncMock, return_value={}) as mock_idempotency:
+            with patch.object(db_client, 'batch_put_events', new_callable=AsyncMock, return_value={
+                "successful_event_ids": ["evt_test123456"],
+                "failed_items": []
+            }) as mock_batch_put:
+                with patch.object(delivery_client, 'deliver_event', new_callable=AsyncMock, return_value=True):
+                    with patch.object(db_client, 'update_event', new_callable=AsyncMock):
+                        with patch('src.handlers.events.get_user_id_from_request', return_value=None):
+
+                            http_request = MagicMock()
+                            response = await batch_create_events(
+                                request, http_request, db_client, sqs_client, delivery_client, metrics_client
+                            )
+
+                            # Should have 1 success and 1 failure
+                            assert len(response.results) == 2
+                            successful_results = [r for r in response.results if r.success]
+                            failed_results = [r for r in response.results if not r.success]
+                            assert len(successful_results) == 1
+                            assert len(failed_results) == 1
+                            assert response.summary.successful == 1
+                            assert response.summary.failed == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_create_events_idempotency_duplicate(self, db_client, sqs_client, delivery_client, metrics_client):
+        """Test batch creation with idempotency key preventing duplicate."""
+        from src.models.request import BatchCreateEventRequest, CreateEventRequest
+        from src.models.event import Event
+        from src.handlers.events import batch_create_events
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock
+
+        # Create existing event for idempotency check
+        existing_event = Event(
+            event_id="evt_existing123",
+            event_type="order.created",
+            payload={"order_id": "123"},
+            status="delivered",
+            created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+            delivered_at=datetime(2024, 1, 15, 10, 30, 2, tzinfo=timezone.utc),
+            delivery_attempts=1
+        )
+
+        events = [
+            CreateEventRequest(
+                event_type="order.created",
+                payload={"order_id": "123"},
+                idempotency_key="order-123-2024-01-15"
+            )
+        ]
+        request = BatchCreateEventRequest(events=events)
+
+        with patch.object(db_client, 'batch_get_events_by_idempotency_keys', new_callable=AsyncMock,
+                        return_value={"order-123-2024-01-15": existing_event}) as mock_idempotency:
+            with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                http_request = MagicMock()
+                response = await batch_create_events(
+                    request, http_request, db_client, sqs_client, delivery_client, metrics_client
+                )
+
+                # Should return existing event as successful
+                assert len(response.results) == 1
+                result = response.results[0]
+                assert result.success
+                assert result.event is not None
+                assert result.event.event_id == "evt_existing123"
+                assert "already exists" in result.event.message
+
+                # Should not call batch_put_events since it's a duplicate
+                # (We can't easily test this without more complex mocking)
+
+    @pytest.mark.asyncio
+    async def test_batch_create_events_exceeds_max_size(self, db_client, sqs_client, delivery_client, metrics_client):
+        """Test batch creation with too many events."""
+        from src.models.request import BatchCreateEventRequest, CreateEventRequest
+        from src.handlers.events import batch_create_events
+        from fastapi import HTTPException
+
+        # Create 101 events (exceeds limit)
+        events = [
+            CreateEventRequest(
+                event_type="order.created",
+                payload={"order_id": str(i)}
+            ) for i in range(101)
+        ]
+        request = BatchCreateEventRequest(events=events)
+
+        with patch('src.handlers.events.get_user_id_from_request', return_value=None):
+            http_request = MagicMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await batch_create_events(
+                    request, http_request, db_client, sqs_client, delivery_client, metrics_client
+                )
+
+            assert exc_info.value.status_code == 400
+            assert "batch size cannot exceed 100" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_batch_update_events_all_success(self, db_client, sqs_client, metrics_client):
+        """Test successful batch update of events."""
+        from src.models.request import BatchUpdateEventRequest, BatchUpdateEventItem
+        from src.models.event import Event
+        from src.handlers.events import batch_update_events
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock
+
+        # Create existing events
+        existing_events = [
+            Event(
+                event_id="evt_test123456",
+                event_type="order.created",
+                payload={"order_id": "123"},
+                status="delivered",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+                delivered_at=datetime(2024, 1, 15, 10, 30, 2, tzinfo=timezone.utc),
+                delivery_attempts=1,
+                user_id="user123"
+            )
+        ]
+
+        # Create update request
+        updates = [
+            BatchUpdateEventItem(
+                event_id="evt_test123456",
+                payload={"order_id": "123", "amount": 150.00}
+            )
+        ]
+        request = BatchUpdateEventRequest(events=updates)
+
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=existing_events) as mock_batch_get:
+            with patch.object(db_client, 'update_event', new_callable=AsyncMock) as mock_update:
+                with patch.object(sqs_client, 'send_message', new_callable=AsyncMock) as mock_sqs:
+                    with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                        http_request = MagicMock()
+                        response = await batch_update_events(request, http_request, db_client, sqs_client)
+
+                        # Assert success
+                        assert len(response.results) == 1
+                        result = response.results[0]
+                        assert result.success
+                        assert result.event is not None
+                        assert "queued for redelivery" in result.event.message
+                        assert response.summary.successful == 1
+                        assert response.summary.failed == 0
+
+                        # Verify SQS was called for redelivery
+                        mock_sqs.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_batch_update_events_ownership_check(self, db_client, sqs_client, metrics_client):
+        """Test batch update with ownership validation."""
+        from src.models.request import BatchUpdateEventRequest, BatchUpdateEventItem
+        from src.models.event import Event
+        from src.handlers.events import batch_update_events
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock
+
+        # Create event owned by different user
+        existing_events = [
+            Event(
+                event_id="evt_test123456",
+                event_type="order.created",
+                payload={"order_id": "123"},
+                status="pending",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+                user_id="other_user"
+            )
+        ]
+
+        updates = [
+            BatchUpdateEventItem(
+                event_id="evt_test123456",
+                payload={"order_id": "123", "amount": 150.00}
+            )
+        ]
+        request = BatchUpdateEventRequest(events=updates)
+
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=existing_events):
+            with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                http_request = MagicMock()
+                response = await batch_update_events(request, http_request, db_client, sqs_client)
+
+                # Should fail due to ownership
+                assert len(response.results) == 1
+                result = response.results[0]
+                assert not result.success
+                assert result.error is not None
+                assert result.error.code == "FORBIDDEN"
+                assert response.summary.failed == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_update_events_not_found(self, db_client, sqs_client, metrics_client):
+        """Test batch update with non-existent event."""
+        from src.models.request import BatchUpdateEventRequest, BatchUpdateEventItem
+        from src.handlers.events import batch_update_events
+        from unittest.mock import AsyncMock
+
+        # Empty results - event not found
+        updates = [
+            BatchUpdateEventItem(
+                event_id="evt_nonexistent",
+                payload={"order_id": "123", "amount": 150.00}
+            )
+        ]
+        request = BatchUpdateEventRequest(events=updates)
+
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=[]):
+            with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                http_request = MagicMock()
+                response = await batch_update_events(request, http_request, db_client, sqs_client)
+
+                # Should fail with NOT_FOUND
+                assert len(response.results) == 1
+                result = response.results[0]
+                assert not result.success
+                assert result.error is not None
+                assert result.error.code == "NOT_FOUND"
+                assert response.summary.failed == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_delete_events_all_success(self, db_client, metrics_client):
+        """Test successful batch deletion of events."""
+        from src.models.request import BatchDeleteEventRequest
+        from src.models.event import Event
+        from src.handlers.events import batch_delete_events
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock
+
+        # Create existing events
+        existing_events = [
+            Event(
+                event_id="evt_test123456",
+                event_type="order.created",
+                payload={"order_id": "123"},
+                status="delivered",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+                user_id="user123"
+            )
+        ]
+
+        # Create delete request
+        request = BatchDeleteEventRequest(event_ids=["evt_test123456"])
+
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=existing_events) as mock_batch_get:
+            with patch.object(db_client, 'batch_delete_events', new_callable=AsyncMock, return_value={
+                "successful_event_ids": ["evt_test123456"],
+                "failed_event_ids": []
+            }) as mock_batch_delete:
+                with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                    http_request = MagicMock()
+                    response = await batch_delete_events(request, http_request, db_client)
+
+                    # Assert success
+                    assert len(response.results) == 1
+                    result = response.results[0]
+                    assert result.success
+                    assert result.event_id == "evt_test123456"
+                    assert result.message == "Event deleted"
+                    assert response.summary.successful == 1
+                    assert response.summary.failed == 0
+
+    @pytest.mark.asyncio
+    async def test_batch_delete_events_idempotent(self, db_client, metrics_client):
+        """Test batch deletion with non-existent events (idempotent)."""
+        from src.models.request import BatchDeleteEventRequest
+        from src.handlers.events import batch_delete_events
+        from unittest.mock import AsyncMock
+
+        # Event not found - should be treated as successful (idempotent delete)
+        request = BatchDeleteEventRequest(event_ids=["evt_nonexistent"])
+
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=[]):
+            with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                http_request = MagicMock()
+                response = await batch_delete_events(request, http_request, db_client)
+
+                # Should succeed (idempotent)
+                assert len(response.results) == 1
+                result = response.results[0]
+                assert result.success
+                assert result.event_id == "evt_nonexistent"
+                assert "idempotent" in result.message
+                assert response.summary.successful == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_delete_events_ownership_check(self, db_client, metrics_client):
+        """Test batch deletion with ownership validation."""
+        from src.models.request import BatchDeleteEventRequest
+        from src.models.event import Event
+        from src.handlers.events import batch_delete_events
+        from datetime import datetime, timezone
+        from unittest.mock import AsyncMock
+
+        # Create event owned by different user
+        existing_events = [
+            Event(
+                event_id="evt_test123456",
+                event_type="order.created",
+                payload={"order_id": "123"},
+                status="pending",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+                user_id="other_user"
+            )
+        ]
+
+        request = BatchDeleteEventRequest(event_ids=["evt_test123456"])
+
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=existing_events):
+            with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                http_request = MagicMock()
+                response = await batch_delete_events(request, http_request, db_client)
+
+                # Should fail due to ownership
+                assert len(response.results) == 1
+                result = response.results[0]
+                assert not result.success
+                assert result.error is not None
+                assert result.error.code == "FORBIDDEN"
+                assert response.summary.failed == 1

@@ -16,10 +16,19 @@ Security Note:
 """
 
 import argparse
+import os
 import secrets
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
+
+# Add project root and src directory to Python path
+# This allows both absolute imports (from src.xxx) and relative imports (from utils.xxx)
+project_root = Path(__file__).parent.parent
+src_dir = project_root / "src"
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(src_dir))
 
 import boto3
 from botocore.exceptions import ClientError
@@ -52,7 +61,8 @@ def store_api_key(
     api_key: str,
     hashed_key: str,
     description: str = "Generated API Key",
-    environment: str = "dev"
+    environment: str = "dev",
+    user_id: Optional[str] = None
 ) -> str:
     """
     Store the hashed API key in DynamoDB.
@@ -82,18 +92,22 @@ def store_api_key(
         now = datetime.now(timezone.utc).isoformat()
 
         # Store in DynamoDB
-        table.put_item(
-            Item={
-                'key_id': key_id,
-                'api_key_hash': hashed_key,
-                'description': description,
-                'environment': environment,
-                'created_at': now,
-                'is_active': True,
-                'last_used_at': None,
-                'usage_count': 0
-            }
-        )
+        # Note: DynamoDB doesn't allow None values, so we only include fields with values
+        item = {
+            'key_id': key_id,
+            'api_key_hash': hashed_key,
+            'description': description,
+            'environment': environment,
+            'created_at': now,
+            'is_active': True,
+            'usage_count': 0
+        }
+        
+        # Add user_id if provided
+        if user_id:
+            item['user_id'] = user_id
+
+        table.put_item(Item=item)
 
         logger.info(
             "API key stored in DynamoDB",
@@ -156,6 +170,13 @@ Security Warning:
     )
 
     parser.add_argument(
+        '--user-id',
+        type=str,
+        default=None,
+        help='User ID to associate with this API key (for user-scoped operations)'
+    )
+
+    parser.add_argument(
         '--confirm',
         action='store_true',
         help='Confirm generation (prevents accidental key creation)'
@@ -192,7 +213,8 @@ Security Warning:
             api_key=api_key,
             hashed_key=hashed_key,
             description=args.description,
-            environment=args.environment
+            environment=args.environment,
+            user_id=args.user_id
         )
         print("   ✅ Key stored successfully")
         print()

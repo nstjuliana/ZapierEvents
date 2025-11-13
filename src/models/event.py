@@ -83,6 +83,14 @@ class Event(BaseModel):
         ge=0,
         description="Number of delivery attempts"
     )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="User ID that created this event (for user-scoped idempotency)"
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        description="Client-provided idempotency key to prevent duplicate events"
+    )
 
     @field_validator('event_type')
     @classmethod
@@ -100,16 +108,17 @@ class Event(BaseModel):
 
         return v
 
-    @field_validator('payload')
+    @field_validator('payload', mode='before')
     @classmethod
-    def validate_payload(cls, v: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate payload is a non-empty dictionary."""
+    def validate_payload(cls, v: Any) -> Dict[str, Any]:
+        """Validate payload is a non-empty dictionary, preserving all JSON types."""
         if not isinstance(v, dict):
             raise ValueError("payload must be a dictionary")
 
         if not v:
             raise ValueError("payload cannot be empty")
 
+        # Return as-is to preserve all JSON types (numbers, strings, booleans, etc.)
         return v
 
     def mark_delivered(self) -> None:

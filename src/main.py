@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
-from handlers.events import router as events_router
+from handlers.events import router as events_router, replay_router
 from handlers.inbox import router as inbox_router
 from config.settings import settings
 from utils.logger import get_logger
@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 app = FastAPI(
     title="Zapier Triggers API",
     description="Event ingestion and delivery API for real-time automation",
-    version="0.1.0",
+    version=settings.app_version,
     docs_url="/docs",  # Swagger UI
     redoc_url="/redoc"  # ReDoc
 )
@@ -37,6 +37,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(events_router)
+app.include_router(replay_router)
 app.include_router(inbox_router)
 
 

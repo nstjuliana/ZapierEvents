@@ -58,10 +58,17 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.warning("No API key provided in request")
             return generate_policy('anonymous', 'Deny', event['methodArn'])
 
-        # Validate API key against stored hashes
-        if _validate_api_key(token):
-            logger.info("API key authentication successful")
-            return generate_policy('authenticated-user', 'Allow', event['methodArn'])
+        # Validate API key against stored hashes and get user_id
+        is_valid, user_id = _validate_api_key(token)
+        if is_valid:
+            # Use user_id if available, otherwise use a default
+            principal_id = user_id if user_id else 'authenticated-user'
+            logger.info(
+                "API key authentication successful",
+                user_id=user_id,
+                principal_id=principal_id
+            )
+            return generate_policy(principal_id, 'Allow', event['methodArn'], user_id)
         else:
             logger.warning("API key authentication failed")
             return generate_policy('anonymous', 'Deny', event['methodArn'])
@@ -107,24 +114,24 @@ def _extract_api_key(event: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _validate_api_key(api_key: str) -> bool:
+def _validate_api_key(api_key: str) -> tuple[bool, Optional[str]]:
     """
-    Validate API key against stored hashes in DynamoDB.
+    Validate API key against stored hashes in DynamoDB and return user_id.
 
     Queries the API keys table and verifies the provided key
-    against all stored hashes. Uses Phase 1 simplification of
-    scanning the table (not optimal for production scale).
+    against all stored hashes. Returns the user_id if found.
+    Uses Phase 1 simplification of scanning the table (not optimal for production scale).
 
     Args:
         api_key: Plain text API key to validate
 
     Returns:
-        True if key is valid, False otherwise
+        Tuple of (is_valid, user_id). user_id is None if key is invalid or not found.
     """
     table_name = os.environ.get('API_KEYS_TABLE_NAME')
     if not table_name:
         logger.error("API_KEYS_TABLE_NAME environment variable not set")
-        return False
+        return False, None
 
     try:
         # Initialize DynamoDB client
@@ -134,28 +141,30 @@ def _validate_api_key(api_key: str) -> bool:
         # Scan for API keys (Phase 1: simple but not scalable)
         # In production, would use key_id lookup or GSI
         response = table.scan(
-            ProjectionExpression='api_key_hash'
+            ProjectionExpression='api_key_hash,user_id'
         )
 
         # Check against all stored hashes
         for item in response.get('Items', []):
             stored_hash = item.get('api_key_hash')
             if stored_hash and verify_api_key(api_key, stored_hash):
-                return True
+                user_id = item.get('user_id')
+                return True, user_id
 
         # Continue scanning if there are more items
         while response.get('LastEvaluatedKey'):
             response = table.scan(
-                ProjectionExpression='api_key_hash',
+                ProjectionExpression='api_key_hash,user_id',
                 ExclusiveStartKey=response['LastEvaluatedKey']
             )
 
             for item in response.get('Items', []):
                 stored_hash = item.get('api_key_hash')
                 if stored_hash and verify_api_key(api_key, stored_hash):
-                    return True
+                    user_id = item.get('user_id')
+                    return True, user_id
 
-        return False
+        return False, None
 
     except Exception as e:
         logger.error(
@@ -163,10 +172,10 @@ def _validate_api_key(api_key: str) -> bool:
             error=str(e),
             table_name=table_name
         )
-        return False
+        return False, None
 
 
-def generate_policy(principal_id: str, effect: str, resource: str) -> Dict[str, Any]:
+def generate_policy(principal_id: str, effect: str, resource: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Generate IAM policy document for API Gateway.
 
@@ -177,14 +186,17 @@ def generate_policy(principal_id: str, effect: str, resource: str) -> Dict[str, 
         principal_id: Identifier for the principal (user/API key)
         effect: "Allow" or "Deny"
         resource: API Gateway method ARN
+        user_id: Optional user ID to include in context
 
     Returns:
         IAM policy document dictionary
 
     Example:
-        >>> policy = generate_policy('user123', 'Allow', 'arn:aws:...')
+        >>> policy = generate_policy('user123', 'Allow', 'arn:aws:...', 'user_test_001')
         >>> policy['policyDocument']['Statement'][0]['Effect']
         'Allow'
+        >>> policy['context']['userId']
+        'user_test_001'
     """
     policy = {
         'principalId': principal_id,
@@ -200,8 +212,10 @@ def generate_policy(principal_id: str, effect: str, resource: str) -> Dict[str, 
 
     # Add context for additional user information (optional)
     if effect == 'Allow':
+        # Use provided user_id if available, otherwise use principal_id
+        context_user_id = user_id if user_id else principal_id
         policy['context'] = {
-            'userId': principal_id,
+            'userId': context_user_id,
             'authenticated': 'true'
         }
 

@@ -55,7 +55,11 @@ htmlcov/
 # Logs
 *.log
 
-_docs
-*.md
-!README.md
-test-phase2-endpoints.py
+# _docs
+# *.md
+# !README.md
+# test-phase2-endpoints.py
+
+test-users.txt
+
+/scripts/*
