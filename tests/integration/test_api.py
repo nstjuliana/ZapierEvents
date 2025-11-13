@@ -518,3 +518,343 @@ class TestApiIntegration:
                 assert "error" in data
                 assert data["error"]["code"] == 500
                 assert "Failed to acknowledge event" in data["error"]["message"]
+
+
+class TestBatchApiIntegration:
+    """Integration tests for batch API endpoints."""
+
+    def test_batch_create_events_end_to_end(self, test_client, mock_dynamodb_table):
+        """Test end-to-end batch create events flow."""
+        from unittest.mock import AsyncMock
+
+        # Mock all dependencies
+        db_client = test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)()
+
+        with patch.object(db_client, 'batch_get_events_by_idempotency_keys', new_callable=AsyncMock, return_value={}) as mock_idempotency:
+            with patch.object(db_client, 'batch_put_events', new_callable=AsyncMock, return_value={
+                "successful_event_ids": ["evt_test001", "evt_test002"],
+                "failed_items": []
+            }) as mock_batch_put:
+                with patch('src.handlers.events.get_delivery_client') as mock_get_delivery:
+                    with patch('src.handlers.events.get_sqs_client') as mock_get_sqs:
+                        with patch('src.handlers.events.get_metrics_client') as mock_get_metrics:
+                            with patch('src.handlers.events.get_user_id_from_request', return_value=None):
+
+                                # Mock delivery client
+                                delivery_client = AsyncMock()
+                                delivery_client.deliver_event.return_value = True
+                                mock_get_delivery.return_value = delivery_client
+
+                                # Mock SQS client
+                                sqs_client = AsyncMock()
+                                mock_get_sqs.return_value = sqs_client
+
+                                # Mock metrics client
+                                metrics_client = AsyncMock()
+                                mock_get_metrics.return_value = metrics_client
+
+                                # Create batch request
+                                batch_request = {
+                                    "events": [
+                                        {
+                                            "event_type": "order.created",
+                                            "payload": {"order_id": "123", "amount": 99.99},
+                                            "metadata": {"source": "test"}
+                                        },
+                                        {
+                                            "event_type": "order.updated",
+                                            "payload": {"order_id": "123", "status": "shipped"}
+                                        }
+                                    ]
+                                }
+
+                                # Make batch create request
+                                response = test_client.post("/events/batch", json=batch_request)
+                                assert response.status_code == 201
+
+                                data = response.json()
+                                assert "results" in data
+                                assert "summary" in data
+                                assert len(data["results"]) == 2
+                                assert all(result["success"] for result in data["results"])
+                                assert data["summary"]["total"] == 2
+                                assert data["summary"]["successful"] == 2
+                                assert data["summary"]["failed"] == 0
+
+                                # Verify delivery was attempted for both events
+                                assert delivery_client.deliver_event.call_count == 2
+
+                                # Verify metrics were published
+                                metrics_client.put_metric.assert_called()
+
+    def test_batch_operations_with_auth(self, test_client):
+        """Test batch operations include user_id from auth context."""
+        from unittest.mock import AsyncMock
+
+        db_client = test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)()
+
+        with patch.object(db_client, 'batch_get_events_by_idempotency_keys', new_callable=AsyncMock, return_value={}) as mock_idempotency:
+            with patch.object(db_client, 'batch_put_events', new_callable=AsyncMock, return_value={
+                "successful_event_ids": ["evt_test001"],
+                "failed_items": []
+            }) as mock_batch_put:
+                with patch('src.handlers.events.get_delivery_client') as mock_get_delivery:
+                    with patch('src.handlers.events.get_sqs_client') as mock_get_sqs:
+                        with patch('src.handlers.events.get_metrics_client') as mock_get_metrics:
+                            with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                                # Mock clients
+                                delivery_client = AsyncMock()
+                                delivery_client.deliver_event.return_value = True
+                                mock_get_delivery.return_value = delivery_client
+
+                                sqs_client = AsyncMock()
+                                mock_get_sqs.return_value = sqs_client
+
+                                metrics_client = AsyncMock()
+                                mock_get_metrics.return_value = metrics_client
+
+                                # Single event batch
+                                batch_request = {
+                                    "events": [
+                                        {
+                                            "event_type": "order.created",
+                                            "payload": {"order_id": "123"}
+                                        }
+                                    ]
+                                }
+
+                                response = test_client.post("/events/batch", json=batch_request)
+                                assert response.status_code == 201
+
+                                # Verify idempotency check was called with user_id
+                                mock_idempotency.assert_called_once()
+                                call_args = mock_idempotency.call_args
+                                assert call_args[1]["user_id"] == "user123"
+
+    def test_large_batch_100_items(self, test_client):
+        """Test batch operation with maximum allowed size (100 items)."""
+        from unittest.mock import AsyncMock
+
+        db_client = test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)()
+
+        with patch.object(db_client, 'batch_get_events_by_idempotency_keys', new_callable=AsyncMock, return_value={}) as mock_idempotency:
+            with patch.object(db_client, 'batch_put_events', new_callable=AsyncMock) as mock_batch_put:
+                with patch('src.handlers.events.get_delivery_client') as mock_get_delivery:
+                    with patch('src.handlers.events.get_sqs_client') as mock_get_sqs:
+                        with patch('src.handlers.events.get_metrics_client') as mock_get_metrics:
+                            with patch('src.handlers.events.get_user_id_from_request', return_value=None):
+
+                                # Mock successful batch put for 100 events
+                                successful_ids = [f"evt_test{i:03d}" for i in range(100)]
+                                mock_batch_put.return_value = {
+                                    "successful_event_ids": successful_ids,
+                                    "failed_items": []
+                                }
+
+                                # Mock delivery client
+                                delivery_client = AsyncMock()
+                                delivery_client.deliver_event.return_value = True
+                                mock_get_delivery.return_value = delivery_client
+
+                                # Mock other clients
+                                sqs_client = AsyncMock()
+                                mock_get_sqs.return_value = sqs_client
+
+                                metrics_client = AsyncMock()
+                                mock_get_metrics.return_value = metrics_client
+
+                                # Create batch with 100 events
+                                batch_request = {
+                                    "events": [
+                                        {
+                                            "event_type": "order.created",
+                                            "payload": {"order_id": str(i)}
+                                        } for i in range(100)
+                                    ]
+                                }
+
+                                # Make request
+                                response = test_client.post("/events/batch", json=batch_request)
+                                assert response.status_code == 201
+
+                                data = response.json()
+                                assert len(data["results"]) == 100
+                                assert data["summary"]["total"] == 100
+                                assert data["summary"]["successful"] == 100
+                                assert data["summary"]["failed"] == 0
+
+                                # Verify delivery was attempted for all events
+                                assert delivery_client.deliver_event.call_count == 100
+
+    def test_batch_create_exceeds_max_size(self, test_client):
+        """Test batch create rejects requests over 100 items."""
+        # Create batch with 101 events
+        batch_request = {
+            "events": [
+                {
+                    "event_type": "order.created",
+                    "payload": {"order_id": str(i)}
+                } for i in range(101)
+            ]
+        }
+
+        response = test_client.post("/events/batch", json=batch_request)
+        assert response.status_code == 400
+
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == 400
+        assert "batch size cannot exceed 100" in data["error"]["message"]
+
+    def test_batch_create_empty_request(self, test_client):
+        """Test batch create rejects empty event list."""
+        batch_request = {"events": []}
+
+        response = test_client.post("/events/batch", json=batch_request)
+        assert response.status_code == 400
+
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == 400
+        assert "events list cannot be empty" in data["error"]["message"]
+
+    def test_batch_update_events_integration(self, test_client, mock_dynamodb_table):
+        """Test end-to-end batch update events flow."""
+        from unittest.mock import AsyncMock
+        from src.models.event import Event
+        from datetime import datetime, timezone
+
+        # First create an existing event
+        existing_event = Event(
+            event_id="evt_test123456",
+            event_type="order.created",
+            payload={"order_id": "123"},
+            status="delivered",
+            created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+            delivered_at=datetime(2024, 1, 15, 10, 30, 2, tzinfo=timezone.utc),
+            delivery_attempts=1,
+            user_id="user123"
+        )
+
+        # Store it in mock DynamoDB
+        db_client = test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)()
+        # Note: We can't easily store in moto mock, so we'll mock the batch_get_events call
+
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=[existing_event]) as mock_batch_get:
+            with patch.object(db_client, 'update_event', new_callable=AsyncMock) as mock_update:
+                with patch('src.handlers.events.get_sqs_client') as mock_get_sqs:
+                    with patch('src.handlers.events.get_metrics_client') as mock_get_metrics:
+                        with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                            # Mock SQS client
+                            sqs_client = AsyncMock()
+                            mock_get_sqs.return_value = sqs_client
+
+                            # Mock metrics client
+                            metrics_client = AsyncMock()
+                            mock_get_metrics.return_value = metrics_client
+
+                            # Create batch update request
+                            batch_request = {
+                                "events": [
+                                    {
+                                        "event_id": "evt_test123456",
+                                        "payload": {"order_id": "123", "amount": 150.00}
+                                    }
+                                ]
+                            }
+
+                            # Make batch update request
+                            response = test_client.patch("/events/batch", json=batch_request)
+                            assert response.status_code == 200
+
+                            data = response.json()
+                            assert len(data["results"]) == 1
+                            result = data["results"][0]
+                            assert result["success"]
+                            assert result["event"] is not None
+                            assert "queued for redelivery" in result["event"]["message"]
+                            assert data["summary"]["successful"] == 1
+
+                            # Verify SQS was called for redelivery
+                            sqs_client.send_message.assert_called_once()
+
+    def test_batch_delete_events_integration(self, test_client, mock_dynamodb_table):
+        """Test end-to-end batch delete events flow."""
+        from unittest.mock import AsyncMock
+        from src.models.event import Event
+        from datetime import datetime, timezone
+
+        # Create existing event
+        existing_event = Event(
+            event_id="evt_test123456",
+            event_type="order.created",
+            payload={"order_id": "123"},
+            status="delivered",
+            created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+            user_id="user123"
+        )
+
+        db_client = test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)()
+
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=[existing_event]) as mock_batch_get:
+            with patch.object(db_client, 'batch_delete_events', new_callable=AsyncMock, return_value={
+                "successful_event_ids": ["evt_test123456"],
+                "failed_event_ids": []
+            }) as mock_batch_delete:
+                with patch('src.handlers.events.get_metrics_client') as mock_get_metrics:
+                    with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                        # Mock metrics client
+                        metrics_client = AsyncMock()
+                        mock_get_metrics.return_value = metrics_client
+
+                        # Create batch delete request
+                        batch_request = {
+                            "event_ids": ["evt_test123456"]
+                        }
+
+                        # Make batch delete request
+                        response = test_client.delete("/events/batch", json=batch_request)
+                        assert response.status_code == 200
+
+                        data = response.json()
+                        assert len(data["results"]) == 1
+                        result = data["results"][0]
+                        assert result["success"]
+                        assert result["event_id"] == "evt_test123456"
+                        assert result["message"] == "Event deleted"
+                        assert data["summary"]["successful"] == 1
+
+                        # Verify batch delete was called
+                        mock_batch_delete.assert_called_once_with(["evt_test123456"])
+
+    def test_batch_delete_idempotent(self, test_client):
+        """Test batch delete is idempotent for non-existent events."""
+        from unittest.mock import AsyncMock
+
+        db_client = test_client.app.dependency_overrides.get('src.handlers.events.get_db_client', lambda: None)()
+
+        # Mock empty results (event not found)
+        with patch.object(db_client, 'batch_get_events', new_callable=AsyncMock, return_value=[]):
+            with patch('src.handlers.events.get_metrics_client') as mock_get_metrics:
+                with patch('src.handlers.events.get_user_id_from_request', return_value="user123"):
+
+                    metrics_client = AsyncMock()
+                    mock_get_metrics.return_value = metrics_client
+
+                    # Delete non-existent event
+                    batch_request = {
+                        "event_ids": ["evt_nonexistent"]
+                    }
+
+                    response = test_client.delete("/events/batch", json=batch_request)
+                    assert response.status_code == 200
+
+                    data = response.json()
+                    assert len(data["results"]) == 1
+                    result = data["results"][0]
+                    assert result["success"]
+                    assert result["event_id"] == "evt_nonexistent"
+                    assert "idempotent" in result["message"]

@@ -22,10 +22,10 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi import status as status_codes
 from fastapi.responses import JSONResponse, Response
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
-from models.request import CreateEventRequest, UpdateEventRequest
-from models.response import EventResponse
+from models.request import CreateEventRequest, UpdateEventRequest, BatchCreateEventRequest, BatchUpdateEventRequest, BatchDeleteEventRequest
+from models.response import EventResponse, BatchCreateResponse, BatchUpdateResponse, BatchDeleteResponse, BatchCreateItemResult, BatchUpdateItemResult, BatchDeleteItemResult, BatchItemError, BatchOperationSummary
 from models.event import Event
 from storage.dynamodb import DynamoDBClient
 from sqs_queue.sqs import SQSClient
@@ -854,4 +854,1000 @@ async def acknowledge_event(
         raise HTTPException(
             status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to acknowledge event"
+        )
+
+
+@router.post("/batch", status_code=status_codes.HTTP_201_CREATED, response_model=BatchCreateResponse)
+async def batch_create_events(
+    request: BatchCreateEventRequest,
+    http_request: Request,
+    db_client: DynamoDBClient = Depends(get_db_client),
+    sqs_client: SQSClient = Depends(get_sqs_client),
+    delivery_client: PushDeliveryClient = Depends(get_delivery_client),
+    metrics_client: MetricsClient = Depends(get_metrics_client)
+) -> BatchCreateResponse:
+    """
+    Create and ingest multiple events in a single batch operation.
+
+    Processes events with best-effort semantics - continues processing even if
+    some events fail. Supports idempotency via per-event idempotency keys.
+    Attempts immediate push delivery for successful events.
+
+    Args:
+        request: BatchCreateEventRequest containing list of events to create
+        http_request: FastAPI Request object for authorization context
+        db_client: DynamoDB client (injected via dependency)
+        sqs_client: SQS client for queuing failed deliveries
+        delivery_client: Push delivery client for Zapier webhook
+        metrics_client: Metrics client for publishing statistics
+
+    Returns:
+        BatchCreateResponse with detailed per-item results and summary
+
+    Raises:
+        HTTPException: 400 if batch validation fails
+        HTTPException: 500 if critical system error occurs
+
+    Example:
+        POST /events/batch
+        {
+          "events": [
+            {
+              "event_type": "order.created",
+              "payload": {"order_id": "12345", "amount": 99.99},
+              "metadata": {"source": "ecommerce-platform"},
+              "idempotency_key": "order-12345-2024-01-15"
+            },
+            {
+              "event_type": "order.updated",
+              "payload": {"order_id": "12345", "status": "shipped"},
+              "metadata": {"source": "ecommerce-platform"}
+            }
+          ]
+        }
+
+        Response (201 Created):
+        {
+          "results": [
+            {
+              "index": 0,
+              "success": true,
+              "event": {
+                "event_id": "evt_abc123xyz456",
+                "status": "delivered",
+                "created_at": "2024-01-15T10:30:01Z",
+                "message": "Event created and delivered"
+              }
+            },
+            {
+              "index": 1,
+              "success": false,
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "payload is required"
+              }
+            }
+          ],
+          "summary": {
+            "total": 2,
+            "successful": 1,
+            "failed": 1
+          }
+        }
+    """
+    try:
+        # Get user_id from auth context
+        user_id = get_user_id_from_request(http_request)
+
+        # Validate batch size
+        from utils.batch_helpers import validate_batch_size
+        validate_batch_size(request.events, 100)
+
+        logger.info(
+            "Starting batch create",
+            batch_size=len(request.events),
+            user_id=user_id
+        )
+
+        results: List[BatchCreateItemResult] = []
+        events_to_store: List[Event] = []
+        events_to_deliver: List[Event] = []
+        index_map: Dict[str, int] = {}  # event_id -> original index
+        idempotent_indices: set[int] = set()  # Track which indices are idempotent matches
+
+        # Process each event in the batch
+        for idx, item in enumerate(request.events):
+            try:
+                # Get user_id for this event: from request body, or fallback to auth context
+                event_user_id = item.user_id or user_id
+
+                # Check for idempotency key duplicate (per event, since user_id may vary)
+                if item.idempotency_key and event_user_id:
+                    existing_event = await db_client.get_event_by_idempotency_key(
+                        user_id=event_user_id,
+                        idempotency_key=item.idempotency_key
+                    )
+
+                    if existing_event:
+                        logger.info(
+                            "Duplicate event creation prevented by idempotency key",
+                            idempotency_key=item.idempotency_key,
+                            user_id=event_user_id,
+                            existing_event_id=existing_event.event_id,
+                            index=idx
+                        )
+
+                        # Return existing event as successful result (but mark as idempotent)
+                        event_response = EventResponse(
+                            event_id=existing_event.event_id,
+                            event_type=existing_event.event_type,
+                            payload=existing_event.payload,
+                            metadata=existing_event.metadata,
+                            status=existing_event.status,
+                            created_at=existing_event.created_at,
+                            delivered_at=existing_event.delivered_at,
+                            delivery_attempts=existing_event.delivery_attempts,
+                            user_id=existing_event.user_id,
+                            idempotency_key=existing_event.idempotency_key,
+                            message="Event already exists with this idempotency key"
+                        )
+
+                        results.append(BatchCreateItemResult(
+                            index=idx,
+                            success=True,
+                            event=event_response
+                        ))
+                        idempotent_indices.add(idx)
+                        continue
+
+                # Generate unique event ID
+                event_id = f"evt_{uuid4().hex[:12]}"
+
+                # Create event model
+                event = Event(
+                    event_id=event_id,
+                    event_type=item.event_type,
+                    payload=item.payload,
+                    metadata=item.metadata,
+                    status="pending",
+                    created_at=datetime.now(timezone.utc),
+                    delivered_at=None,
+                    delivery_attempts=0,
+                    user_id=event_user_id,
+                    idempotency_key=item.idempotency_key
+                )
+
+                # Add to lists for batch operations
+                events_to_store.append(event)
+                events_to_deliver.append(event)
+                index_map[event_id] = idx
+
+                logger.info(
+                    "Prepared event for batch processing",
+                    event_id=event_id,
+                    event_type=item.event_type,
+                    index=idx,
+                    has_idempotency_key=bool(item.idempotency_key)
+                )
+
+            except Exception as e:
+                # Validation or other error for this item
+                logger.warning(
+                    "Failed to prepare event for batch creation",
+                    index=idx,
+                    error=str(e),
+                    event_type=getattr(item, 'event_type', 'unknown')
+                )
+
+                results.append(BatchCreateItemResult(
+                    index=idx,
+                    success=False,
+                    error=BatchItemError(
+                        code="VALIDATION_ERROR",
+                        message=str(e)
+                    )
+                ))
+
+        # Batch store events in DynamoDB
+        successful_event_ids = []
+        if events_to_store:
+            batch_result = await db_client.batch_put_events(events_to_store)
+            successful_event_ids = batch_result["successful_event_ids"]
+
+            # Process failed events from batch storage
+            for failed_item in batch_result["failed_items"]:
+                failed_event_id = failed_item["event_id"]
+                original_idx = index_map.get(failed_event_id)
+
+                if original_idx is not None:
+                    results.append(BatchCreateItemResult(
+                        index=original_idx,
+                        success=False,
+                        error=BatchItemError(
+                            code="STORAGE_ERROR",
+                            message=failed_item["reason"]
+                        )
+                    ))
+
+                    # Remove from delivery list
+                    events_to_deliver = [e for e in events_to_deliver if e.event_id != failed_event_id]
+
+        # Attempt delivery for successful events
+        delivered_event_ids = []
+        if events_to_deliver:
+            for event in events_to_deliver:
+                try:
+                    delivery_success = await delivery_client.deliver_event(event)
+
+                    if delivery_success:
+                        event.status = "delivered"
+                        event.delivered_at = datetime.now(timezone.utc)
+                        event.delivery_attempts = 1
+                        delivered_event_ids.append(event.event_id)
+
+                        # Publish delivery metrics
+                        try:
+                            metrics_client.put_metric(
+                                metric_name="EventDelivered",
+                                value=1.0,
+                                dimensions={"EventType": event.event_type}
+                            )
+                        except Exception:
+                            pass
+
+                        logger.info("Event delivered immediately in batch", event_id=event.event_id)
+                    else:
+                        # Queue to SQS for retry
+                        await sqs_client.send_message(
+                            event_id=event.event_id,
+                            event_data=event.model_dump(mode='json')
+                        )
+                        logger.info("Event queued for retry in batch", event_id=event.event_id)
+
+                except Exception as e:
+                    logger.warning(
+                        "Push delivery failed in batch, queueing to SQS",
+                        event_id=event.event_id,
+                        error=str(e)
+                    )
+                    try:
+                        await sqs_client.send_message(
+                            event_id=event.event_id,
+                            event_data=event.model_dump(mode='json')
+                        )
+                    except Exception as queue_error:
+                        logger.error(
+                            "Failed to queue event to SQS in batch",
+                            event_id=event.event_id,
+                            error=str(queue_error)
+                        )
+
+        # Update delivered events in DynamoDB
+        if delivered_event_ids:
+            delivered_events = [e for e in events_to_deliver if e.event_id in delivered_event_ids]
+            if delivered_events:
+                # Note: We could batch update these, but for simplicity we'll update individually
+                # In a production system, you might want to add a batch_update_events method
+                for event in delivered_events:
+                    try:
+                        await db_client.update_event(event)
+                    except Exception as e:
+                        logger.error(
+                            "Failed to update delivered event status in batch",
+                            event_id=event.event_id,
+                            error=str(e)
+                        )
+
+        # Build final results for successful events
+        for event in events_to_store:
+            if event.event_id in successful_event_ids:
+                original_idx = index_map[event.event_id]
+                event_response = EventResponse(
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    payload=event.payload,
+                    metadata=event.metadata,
+                    status=event.status,
+                    created_at=event.created_at,
+                    delivered_at=event.delivered_at,
+                    delivery_attempts=event.delivery_attempts,
+                    user_id=event.user_id,
+                    idempotency_key=event.idempotency_key,
+                    message=f"Event {event.status}"
+                )
+
+                results.append(BatchCreateItemResult(
+                    index=original_idx,
+                    success=True,
+                    event=event_response
+                ))
+
+        # Sort results by original index
+        results.sort(key=lambda r: r.index)
+
+        # Calculate summary
+        # Successful = newly created events (not idempotent)
+        successful_count = sum(1 for r in results if r.success and r.index not in idempotent_indices)
+        idempotent_count = len(idempotent_indices)
+        failed_count = sum(1 for r in results if not r.success)
+
+        summary = BatchOperationSummary(
+            total=len(results),
+            successful=successful_count,
+            idempotent=idempotent_count,
+            failed=failed_count
+        )
+
+        # Publish batch metrics
+        try:
+            metrics_client.put_metric(
+                metric_name="BatchCreateEvents",
+                value=1.0,
+                dimensions={"BatchSize": str(len(request.events))}
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "Batch create completed",
+            total=len(results),
+            successful=successful_count,
+            idempotent=idempotent_count,
+            failed=failed_count,
+            user_id=user_id
+        )
+
+        return BatchCreateResponse(
+            results=results,
+            summary=summary
+        )
+
+    except ValueError as e:
+        # Batch validation error
+        logger.warning(
+            "Batch create validation failed",
+            error=str(e),
+            batch_size=len(getattr(request, 'events', []))
+        )
+        raise HTTPException(
+            status_code=status_codes.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid batch request: {str(e)}"
+        )
+
+    except Exception as e:
+        # Critical system error
+        logger.error(
+            "Critical error in batch create",
+            error=str(e),
+            batch_size=len(getattr(request, 'events', []))
+        )
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process batch create request"
+        )
+
+
+@router.patch("/batch", response_model=BatchUpdateResponse)
+async def batch_update_events(
+    request: BatchUpdateEventRequest,
+    http_request: Request,
+    db_client: DynamoDBClient = Depends(get_db_client),
+    sqs_client: SQSClient = Depends(get_sqs_client),
+    metrics_client: MetricsClient = Depends(get_metrics_client)
+) -> BatchUpdateResponse:
+    """
+    Update multiple events in a single batch operation.
+
+    Processes event updates with best-effort semantics - continues processing
+    even if some updates fail. Enforces ownership checks for security.
+    Events with status "delivered" or "replayed" are reset to "pending" and
+    queued for redelivery.
+
+    Args:
+        request: BatchUpdateEventRequest containing list of event updates
+        http_request: FastAPI Request object for authorization context
+        db_client: DynamoDB client (injected via dependency)
+        sqs_client: SQS client for queuing redelivery
+
+    Returns:
+        BatchUpdateResponse with detailed per-item results and summary
+
+    Raises:
+        HTTPException: 400 if batch validation fails
+        HTTPException: 500 if critical system error occurs
+
+    Example:
+        PATCH /events/batch
+        {
+          "events": [
+            {
+              "event_id": "evt_abc123xyz456",
+              "payload": {"order_id": "12345", "amount": 150.00},
+              "metadata": {"updated": true}
+            },
+            {
+              "event_id": "evt_def789uvw012",
+              "idempotency_key": "order-67890-2024-01-15"
+            }
+          ]
+        }
+
+        Response (200 OK):
+        {
+          "results": [
+            {
+              "index": 0,
+              "success": true,
+              "event": {
+                "event_id": "evt_abc123xyz456",
+                "status": "pending",
+                "created_at": "2024-01-15T10:30:01Z",
+                "message": "Event updated and queued for redelivery"
+              }
+            },
+            {
+              "index": 1,
+              "success": false,
+              "error": {
+                "code": "FORBIDDEN",
+                "message": "You can only update your own events"
+              }
+            }
+          ],
+          "summary": {
+            "total": 2,
+            "successful": 1,
+            "failed": 1
+          }
+        }
+    """
+    try:
+        # Get user_id from auth context
+        user_id = get_user_id_from_request(http_request)
+
+        # Validate batch size
+        from utils.batch_helpers import validate_batch_size
+        validate_batch_size(request.events, 100)
+
+        logger.info(
+            "Starting batch update",
+            batch_size=len(request.events),
+            user_id=user_id
+        )
+
+        results: List[BatchUpdateItemResult] = []
+
+        # Extract all event_ids for batch retrieval
+        event_ids = [item.event_id for item in request.events]
+
+        # Batch get existing events from DynamoDB
+        existing_events = await db_client.batch_get_events(event_ids)
+        events_by_id = {event.event_id: event for event in existing_events}
+
+        # Process each update in the batch
+        events_to_update: List[Event] = []
+        index_map: Dict[str, int] = {}  # event_id -> original index
+
+        for idx, item in enumerate(request.events):
+            try:
+                # Check if event exists
+                event = events_by_id.get(item.event_id)
+                if not event:
+                    results.append(BatchUpdateItemResult(
+                        index=idx,
+                        success=False,
+                        error=BatchItemError(
+                            code="NOT_FOUND",
+                            message=f"Event {item.event_id} not found"
+                        )
+                    ))
+                    continue
+
+                # Verify ownership (only check if auth is enabled and user_id is set)
+                if user_id is not None and event.user_id != user_id:
+                    logger.warning(
+                        "Unauthorized batch event update attempt",
+                        event_id=item.event_id,
+                        requested_by=user_id,
+                        event_owner=event.user_id,
+                        index=idx
+                    )
+                    results.append(BatchUpdateItemResult(
+                        index=idx,
+                        success=False,
+                        error=BatchItemError(
+                            code="FORBIDDEN",
+                            message="You can only update your own events"
+                        )
+                    ))
+                    continue
+
+                # Check which fields were explicitly provided
+                provided_fields = item.model_dump(exclude_unset=True)
+
+                # Validate at least one field is provided
+                update_fields = []
+                if 'payload' in provided_fields:
+                    if item.payload is not None:
+                        event.payload = item.payload
+                        update_fields.append("payload")
+                    else:
+                        results.append(BatchUpdateItemResult(
+                            index=idx,
+                            success=False,
+                            error=BatchItemError(
+                                code="VALIDATION_ERROR",
+                                message="payload cannot be null"
+                            )
+                        ))
+                        continue
+
+                if 'metadata' in provided_fields:
+                    # metadata can be set to None to remove it
+                    event.metadata = item.metadata
+                    update_fields.append("metadata")
+
+                if 'idempotency_key' in provided_fields:
+                    # idempotency_key can be set to None to remove it
+                    event.idempotency_key = item.idempotency_key
+                    if item.idempotency_key is None:
+                        update_fields.append("idempotency_key (removed)")
+                    else:
+                        update_fields.append("idempotency_key")
+
+                # Validate that at least one field was provided
+                if not update_fields:
+                    results.append(BatchUpdateItemResult(
+                        index=idx,
+                        success=False,
+                        error=BatchItemError(
+                            code="VALIDATION_ERROR",
+                            message="At least one of payload, metadata, or idempotency_key must be provided"
+                        )
+                    ))
+                    continue
+
+                # Smart status handling for redelivery
+                previous_status = event.status
+                should_redeliver = event.status in ["delivered", "replayed"]
+                if should_redeliver:
+                    # Reset to pending for redelivery
+                    event.status = "pending"
+                    event.delivered_at = None
+
+                    logger.info(
+                        "Event updated and reset for redelivery",
+                        event_id=event.event_id,
+                        previous_status=previous_status,
+                        updated_fields=update_fields,
+                        index=idx
+                    )
+
+                    # Queue to SQS for immediate redelivery
+                    try:
+                        await sqs_client.send_message(
+                            event_id=event.event_id,
+                            event_data=event.model_dump(mode='json')
+                        )
+                        logger.info("Updated event queued for redelivery", event_id=event.event_id)
+                    except Exception as queue_error:
+                        logger.error(
+                            "Failed to queue updated event for redelivery",
+                            event_id=event.event_id,
+                            error=str(queue_error)
+                        )
+                        # Don't fail the update, just log the error
+                else:
+                    logger.info(
+                        "Event updated without status change",
+                        event_id=event.event_id,
+                        status=event.status,
+                        updated_fields=update_fields,
+                        index=idx
+                    )
+
+                # Add to batch update list
+                events_to_update.append(event)
+                index_map[event.event_id] = idx
+
+            except Exception as e:
+                # Unexpected error for this item
+                logger.warning(
+                    "Failed to process event update in batch",
+                    event_id=item.event_id,
+                    index=idx,
+                    error=str(e)
+                )
+
+                results.append(BatchUpdateItemResult(
+                    index=idx,
+                    success=False,
+                    error=BatchItemError(
+                        code="VALIDATION_ERROR",
+                        message=str(e)
+                    )
+                ))
+
+        # Batch update events in DynamoDB (using individual put_item for now)
+        # Note: In a production system, you might want to add a batch_update_events method
+        successful_event_ids = []
+        for event in events_to_update:
+            try:
+                await db_client.update_event(event)
+                successful_event_ids.append(event.event_id)
+                logger.info(
+                    "Event updated in batch",
+                    event_id=event.event_id,
+                    status=event.status
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to update event in DynamoDB batch",
+                    event_id=event.event_id,
+                    error=str(e)
+                )
+                # Mark as failed
+                original_idx = index_map[event.event_id]
+                results.append(BatchUpdateItemResult(
+                    index=original_idx,
+                    success=False,
+                    error=BatchItemError(
+                        code="STORAGE_ERROR",
+                        message=f"Failed to update event: {str(e)}"
+                    )
+                ))
+
+        # Build final results for successful updates
+        for event in events_to_update:
+            if event.event_id in successful_event_ids:
+                original_idx = index_map[event.event_id]
+
+                message = "Event updated"
+                if event.status == "pending":
+                    message += " and queued for redelivery"
+                else:
+                    message += " successfully"
+
+                event_response = EventResponse(
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    payload=event.payload,
+                    metadata=event.metadata,
+                    status=event.status,
+                    created_at=event.created_at,
+                    delivered_at=event.delivered_at,
+                    delivery_attempts=event.delivery_attempts,
+                    user_id=event.user_id,
+                    idempotency_key=event.idempotency_key,
+                    message=message
+                )
+
+                results.append(BatchUpdateItemResult(
+                    index=original_idx,
+                    success=True,
+                    event=event_response
+                ))
+
+        # Sort results by original index
+        results.sort(key=lambda r: r.index)
+
+        # Calculate summary
+        successful_count = sum(1 for r in results if r.success)
+        failed_count = len(results) - successful_count
+
+        summary = BatchOperationSummary(
+            total=len(results),
+            successful=successful_count,
+            failed=failed_count
+        )
+
+        # Publish batch metrics
+        try:
+            metrics_client.put_metric(
+                metric_name="BatchUpdateEvents",
+                value=1.0,
+                dimensions={"BatchSize": str(len(request.events))}
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "Batch update completed",
+            total=len(results),
+            successful=successful_count,
+            failed=failed_count,
+            user_id=user_id
+        )
+
+        return BatchUpdateResponse(
+            results=results,
+            summary=summary
+        )
+
+    except ValueError as e:
+        # Batch validation error
+        logger.warning(
+            "Batch update validation failed",
+            error=str(e),
+            batch_size=len(getattr(request, 'events', []))
+        )
+        raise HTTPException(
+            status_code=status_codes.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid batch request: {str(e)}"
+        )
+
+    except Exception as e:
+        # Critical system error
+        logger.error(
+            "Critical error in batch update",
+            error=str(e),
+            batch_size=len(getattr(request, 'events', []))
+        )
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process batch update request"
+        )
+
+
+@router.delete("/batch", response_model=BatchDeleteResponse)
+async def batch_delete_events(
+    request: BatchDeleteEventRequest,
+    http_request: Request,
+    db_client: DynamoDBClient = Depends(get_db_client),
+    metrics_client: MetricsClient = Depends(get_metrics_client)
+) -> BatchDeleteResponse:
+    """
+    Delete multiple events in a single batch operation.
+
+    Processes event deletions with best-effort semantics - continues processing
+    even if some deletions fail. Enforces ownership checks for security.
+    Missing events are treated as successful (idempotent delete).
+
+    Args:
+        request: BatchDeleteEventRequest containing list of event IDs to delete
+        http_request: FastAPI Request object for authorization context
+        db_client: DynamoDB client (injected via dependency)
+
+    Returns:
+        BatchDeleteResponse with detailed per-item results and summary
+
+    Raises:
+        HTTPException: 400 if batch validation fails
+        HTTPException: 500 if critical system error occurs
+
+    Example:
+        DELETE /events/batch
+        {
+          "event_ids": [
+            "evt_abc123xyz456",
+            "evt_def789uvw012"
+          ]
+        }
+
+        Response (200 OK):
+        {
+          "results": [
+            {
+              "index": 0,
+              "success": true,
+              "event_id": "evt_abc123xyz456",
+              "message": "Event deleted"
+            },
+            {
+              "index": 1,
+              "success": false,
+              "event_id": "evt_def789uvw012",
+              "error": {
+                "code": "FORBIDDEN",
+                "message": "You can only delete your own events"
+              }
+            }
+          ],
+          "summary": {
+            "total": 2,
+            "successful": 1,
+            "failed": 1
+          }
+        }
+    """
+    try:
+        # Get user_id from auth context
+        user_id = get_user_id_from_request(http_request)
+
+        # Validate batch size
+        from utils.batch_helpers import validate_batch_size
+        validate_batch_size(request.event_ids, 100)
+
+        logger.info(
+            "Starting batch delete",
+            batch_size=len(request.event_ids),
+            user_id=user_id
+        )
+
+        results: List[BatchDeleteItemResult] = []
+
+        # Batch get existing events from DynamoDB to check ownership
+        existing_events = await db_client.batch_get_events(request.event_ids)
+        events_by_id = {event.event_id: event for event in existing_events}
+
+        # Process each deletion in the batch
+        event_ids_to_delete = []
+
+        for idx, event_id in enumerate(request.event_ids):
+            try:
+                # Check if event exists
+                event = events_by_id.get(event_id)
+                if not event:
+                    # Event doesn't exist - idempotent delete (already deleted)
+                    logger.info(
+                        "Delete requested for non-existent event (idempotent)",
+                        event_id=event_id,
+                        index=idx,
+                        requested_by=user_id
+                    )
+                    results.append(BatchDeleteItemResult(
+                        index=idx,
+                        success=True,
+                        event_id=event_id,
+                        message="Event already deleted (idempotent)"
+                    ))
+                    continue
+
+                # Verify ownership (only check if auth is enabled and user_id is set)
+                if user_id is not None and event.user_id != user_id:
+                    logger.warning(
+                        "Unauthorized batch event delete attempt",
+                        event_id=event_id,
+                        requested_by=user_id,
+                        event_owner=event.user_id,
+                        index=idx
+                    )
+                    results.append(BatchDeleteItemResult(
+                        index=idx,
+                        success=False,
+                        event_id=event_id,
+                        error=BatchItemError(
+                            code="FORBIDDEN",
+                            message="You can only delete your own events"
+                        )
+                    ))
+                    continue
+
+                # Add to deletion list
+                event_ids_to_delete.append(event_id)
+                logger.info(
+                    "Event marked for batch deletion",
+                    event_id=event_id,
+                    event_type=event.event_type,
+                    index=idx
+                )
+
+            except Exception as e:
+                # Unexpected error for this item
+                logger.warning(
+                    "Failed to process event deletion in batch",
+                    event_id=event_id,
+                    index=idx,
+                    error=str(e)
+                )
+
+                results.append(BatchDeleteItemResult(
+                    index=idx,
+                    success=False,
+                    event_id=event_id,
+                    error=BatchItemError(
+                        code="VALIDATION_ERROR",
+                        message=str(e)
+                    )
+                ))
+
+        # Batch delete events from DynamoDB
+        successful_event_ids = []
+        if event_ids_to_delete:
+            batch_result = await db_client.batch_delete_events(event_ids_to_delete)
+            successful_event_ids = batch_result["successful_event_ids"]
+
+            # Process failed deletions
+            failed_event_ids = batch_result["failed_event_ids"]
+            for failed_event_id in failed_event_ids:
+                # Find original index for this event_id
+                original_idx = None
+                for idx, event_id in enumerate(request.event_ids):
+                    if event_id == failed_event_id:
+                        original_idx = idx
+                        break
+
+                if original_idx is not None:
+                    results.append(BatchDeleteItemResult(
+                        index=original_idx,
+                        success=False,
+                        event_id=failed_event_id,
+                        error=BatchItemError(
+                            code="STORAGE_ERROR",
+                            message="Failed to delete event from database"
+                        )
+                    ))
+
+        # Build final results for successful deletions
+        for event_id in event_ids_to_delete:
+            if event_id in successful_event_ids:
+                # Find original index for this event_id
+                original_idx = None
+                for idx, req_event_id in enumerate(request.event_ids):
+                    if req_event_id == event_id:
+                        original_idx = idx
+                        break
+
+                if original_idx is not None:
+                    results.append(BatchDeleteItemResult(
+                        index=original_idx,
+                        success=True,
+                        event_id=event_id,
+                        message="Event deleted"
+                    ))
+
+                    logger.info(
+                        "Event deleted successfully in batch",
+                        event_id=event_id,
+                        index=original_idx
+                    )
+
+        # Sort results by original index
+        results.sort(key=lambda r: r.index)
+
+        # Calculate summary
+        successful_count = sum(1 for r in results if r.success)
+        failed_count = len(results) - successful_count
+
+        summary = BatchOperationSummary(
+            total=len(results),
+            successful=successful_count,
+            failed=failed_count
+        )
+
+        # Publish batch metrics
+        try:
+            metrics_client.put_metric(
+                metric_name="BatchDeleteEvents",
+                value=1.0,
+                dimensions={"BatchSize": str(len(request.event_ids))}
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "Batch delete completed",
+            total=len(results),
+            successful=successful_count,
+            failed=failed_count,
+            user_id=user_id
+        )
+
+        return BatchDeleteResponse(
+            results=results,
+            summary=summary
+        )
+
+    except ValueError as e:
+        # Batch validation error
+        logger.warning(
+            "Batch delete validation failed",
+            error=str(e),
+            batch_size=len(getattr(request, 'event_ids', []))
+        )
+        raise HTTPException(
+            status_code=status_codes.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid batch request: {str(e)}"
+        )
+
+    except Exception as e:
+        # Critical system error
+        logger.error(
+            "Critical error in batch delete",
+            error=str(e),
+            batch_size=len(getattr(request, 'event_ids', []))
+        )
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process batch delete request"
         )

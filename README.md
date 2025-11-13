@@ -270,6 +270,69 @@ Mark an event as successfully delivered.
 
 Retrieve events waiting for delivery (alias for `GET /events?status=pending`).
 
+### Batch Operations
+
+The API supports efficient batch operations for processing multiple events in a single request:
+
+#### POST /events/batch - Batch Create Events
+
+Create up to 100 events in a single request with automatic delivery attempts.
+
+**Request Body:**
+```json
+{
+  "events": [
+    {
+      "event_type": "order.created",
+      "payload": {"order_id": "123", "amount": 99.99},
+      "metadata": {"source": "api"},
+      "idempotency_key": "order-123-2024-01-15"
+    },
+    {
+      "event_type": "order.updated",
+      "payload": {"order_id": "123", "status": "shipped"}
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "results": [
+    {
+      "index": 0,
+      "success": true,
+      "event": {
+        "event_id": "evt_abc123xyz456",
+        "status": "delivered",
+        "message": "Event created and delivered"
+      }
+    }
+  ],
+  "summary": {
+    "total": 2,
+    "successful": 1,
+    "failed": 1
+  }
+}
+```
+
+#### PATCH /events/batch - Batch Update Events
+
+Update up to 100 events with ownership validation and automatic redelivery.
+
+#### DELETE /events/batch - Batch Delete Events
+
+Delete up to 100 events with ownership validation and idempotent behavior.
+
+**📖 For complete batch API documentation**, see [`_docs/event-batching.md`](_docs/event-batching.md) for:
+- Detailed request/response formats
+- Error handling and status codes
+- Performance considerations
+- Client code examples
+- Best practices
+
 ### Interactive Documentation
 
 - **Swagger UI**: Visit `/docs` for interactive API documentation

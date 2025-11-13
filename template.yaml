@@ -122,6 +122,24 @@ Resources:
             ApiId: !Ref TriggersApi
             Path: /events/{id}
             Method: DELETE
+        BatchCreateEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events/batch
+            Method: POST
+        BatchUpdateEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events/batch
+            Method: PATCH
+        BatchDeleteEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref TriggersApi
+            Path: /events/batch
+            Method: DELETE
 
   # SQS polling Lambda worker
   DeliveryWorkerFunction:
@@ -316,35 +334,6 @@ Resources:
         - !Ref DLQAlarmTopic
       TreatMissingData: notBreaching
 
-Outputs:
-  ApiUrl:
-    Description: API Gateway endpoint URL
-    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com'
-  HealthEndpoint:
-    Description: Health check endpoint URL
-    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com/health'
-  EventsEndpoint:
-    Description: Events API endpoint URL
-    Value: !Sub 'https://${TriggersApi}.execute-api.${AWS::Region}.amazonaws.com/events'
-  EventsFunctionArn:
-    Description: Events Function ARN
-    Value: !GetAtt EventsFunction.Arn
-  ApiKeyAuthorizerArn:
-    Description: API Key Authorizer Function ARN
-    Value: !GetAtt ApiKeyAuthorizer.Arn
-  EventsTableName:
-    Description: Events DynamoDB table name
-    Value: !Ref EventsTable
-  APIKeysTableName:
-    Description: API Keys DynamoDB table name
-    Value: !Ref APIKeysTable
-  InboxQueueUrl:
-    Description: SQS inbox queue URL
-    Value: !Ref InboxQueue
-  InboxDLQUrl:
-    Description: SQS inbox DLQ URL
-    Value: !Ref InboxDLQ
-
   # CloudWatch Dashboard for monitoring
   MonitoringDashboard:
     Type: AWS::CloudWatch::Dashboard
@@ -460,3 +449,9 @@ Outputs:
   APIKeysTableName:
     Description: API Keys DynamoDB table name
     Value: !Ref APIKeysTable
+  InboxQueueUrl:
+    Description: SQS inbox queue URL
+    Value: !Ref InboxQueue
+  InboxDLQUrl:
+    Description: SQS inbox DLQ URL
+    Value: !Ref InboxDLQ

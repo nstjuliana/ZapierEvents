@@ -17,7 +17,7 @@ Author: Triggers API Team
 
 import boto3
 from botocore.exceptions import ClientError
-from typing import Optional, List, Dict
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import base64
 import json
@@ -585,3 +585,463 @@ class DynamoDBClient:
                 error=str(e)
             )
             raise
+
+    async def batch_put_events(self, events: List[Event]) -> Dict[str, Any]:
+        """
+        Store multiple events in DynamoDB with internal chunking.
+
+        Processes events in chunks of 25 (DynamoDB batch_write_item limit).
+        Uses batch_write_item for efficiency and handles UnprocessedItems.
+        Continues processing remaining chunks even if some fail.
+
+        Args:
+            events: List of Event models to store
+
+        Returns:
+            Dict with 'successful_event_ids' list and 'failed_items' list (with reasons)
+
+        Raises:
+            ValueError: If events list is invalid
+        """
+        if not isinstance(events, list):
+            raise ValueError("events must be a list")
+        if not events:
+            return {"successful_event_ids": [], "failed_items": []}
+        if len(events) > 100:
+            raise ValueError("batch size cannot exceed 100 events")
+
+        # Validate all events
+        for event in events:
+            if not isinstance(event, Event):
+                raise ValueError("all items must be Event instances")
+
+        from utils.batch_helpers import chunk_list
+        successful_event_ids = []
+        failed_items = []
+
+        # Process events in chunks of 25 (DynamoDB batch limit)
+        chunks = chunk_list(events, 25)
+
+        for chunk_idx, chunk in enumerate(chunks):
+            try:
+                # Prepare batch write request
+                request_items = {}
+                event_map = {}  # Map event_id to event for error handling
+
+                for event in chunk:
+                    item = event.model_dump()
+                    item['created_at'] = item['created_at'].isoformat()
+                    if item.get('delivered_at') and item['delivered_at'] is not None:
+                        item['delivered_at'] = item['delivered_at'].isoformat()
+
+                    # Serialize payload and metadata
+                    if 'payload' in item:
+                        item['payload'] = json.dumps(item['payload'])
+                    if 'metadata' in item and item.get('metadata') is not None:
+                        item['metadata'] = json.dumps(item['metadata'])
+
+                    # Remove None values
+                    item = {k: v for k, v in item.items() if v is not None}
+
+                    request_items[f"{self.table_name}"] = request_items.get(f"{self.table_name}", [])
+                    request_items[f"{self.table_name}"].append({"PutRequest": {"Item": item}})
+                    event_map[event.event_id] = event
+
+                # Execute batch write
+                response = self.dynamodb.batch_write_item(RequestItems=request_items)
+
+                # Handle unprocessed items (retry logic could be added here)
+                unprocessed = response.get('UnprocessedItems', {}).get(self.table_name, [])
+                if unprocessed:
+                    logger.warning(
+                        f"Some items not processed in chunk {chunk_idx}",
+                        unprocessed_count=len(unprocessed),
+                        total_in_chunk=len(chunk),
+                        table_name=self.table_name
+                    )
+                    # For now, mark unprocessed items as failed
+                    for unprocessed_item in unprocessed:
+                        item = unprocessed_item.get('PutRequest', {}).get('Item', {})
+                        if 'event_id' in item:
+                            failed_items.append({
+                                "event_id": item['event_id'],
+                                "reason": "Unprocessed by DynamoDB"
+                            })
+
+                # Mark successful items
+                processed_event_ids = [event.event_id for event in chunk]
+                for unprocessed_item in unprocessed:
+                    item = unprocessed_item.get('PutRequest', {}).get('Item', {})
+                    if 'event_id' in item and item['event_id'] in processed_event_ids:
+                        processed_event_ids.remove(item['event_id'])
+
+                successful_event_ids.extend(processed_event_ids)
+
+                logger.info(
+                    f"Processed batch chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    successful=len(processed_event_ids),
+                    failed=len(unprocessed),
+                    table_name=self.table_name
+                )
+
+            except ClientError as e:
+                logger.error(
+                    f"Failed to batch write chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    table_name=self.table_name,
+                    error_code=e.response['Error']['Code'],
+                    error_message=e.response['Error']['Message']
+                )
+                # Mark entire chunk as failed
+                for event in chunk:
+                    failed_items.append({
+                        "event_id": event.event_id,
+                        "reason": f"DynamoDB error: {e.response['Error']['Message']}"
+                    })
+
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error in batch write chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    table_name=self.table_name,
+                    error=str(e)
+                )
+                # Mark entire chunk as failed
+                for event in chunk:
+                    failed_items.append({
+                        "event_id": event.event_id,
+                        "reason": f"Unexpected error: {str(e)}"
+                    })
+
+        logger.info(
+            "Batch put events completed",
+            total_events=len(events),
+            successful=len(successful_event_ids),
+            failed=len(failed_items),
+            table_name=self.table_name
+        )
+
+        return {
+            "successful_event_ids": successful_event_ids,
+            "failed_items": failed_items
+        }
+
+    async def batch_get_events(self, event_ids: List[str]) -> List[Event]:
+        """
+        Retrieve multiple events by ID with internal chunking.
+
+        Processes event_ids in chunks of 25 (DynamoDB batch_get_item limit).
+        Uses batch_get_item for efficiency and handles UnprocessedKeys.
+        Returns found events in arbitrary order (DynamoDB doesn't guarantee order).
+
+        Args:
+            event_ids: List of event IDs to retrieve
+
+        Returns:
+            List of found Event models (missing events not included)
+
+        Raises:
+            ValueError: If event_ids list is invalid
+        """
+        if not isinstance(event_ids, list):
+            raise ValueError("event_ids must be a list")
+        if not event_ids:
+            return []
+        if len(event_ids) > 100:
+            raise ValueError("batch size cannot exceed 100 events")
+
+        # Validate event IDs
+        for event_id in event_ids:
+            if not isinstance(event_id, str) or not event_id.strip():
+                raise ValueError("all event_ids must be non-empty strings")
+
+        from utils.batch_helpers import chunk_list
+        all_events = []
+
+        # Process event_ids in chunks of 25 (DynamoDB batch limit)
+        chunks = chunk_list(event_ids, 25)
+
+        for chunk_idx, chunk in enumerate(chunks):
+            try:
+                # Prepare batch get request
+                keys = [{"event_id": event_id} for event_id in chunk]
+
+                response = self.dynamodb.batch_get_item(
+                    RequestItems={
+                        self.table_name: {
+                            "Keys": keys
+                        }
+                    }
+                )
+
+                # Process found items
+                items = response.get('Responses', {}).get(self.table_name, [])
+                for item in items:
+                    # Deserialize payload and metadata
+                    if 'payload' in item:
+                        if isinstance(item['payload'], str):
+                            item['payload'] = json.loads(item['payload'])
+                    if 'metadata' in item and item.get('metadata') is not None:
+                        if isinstance(item['metadata'], str):
+                            item['metadata'] = json.loads(item['metadata'])
+
+                    # Convert datetime strings
+                    if 'created_at' in item:
+                        item['created_at'] = datetime.fromisoformat(item['created_at'])
+                    if 'delivered_at' in item and item['delivered_at'] is not None:
+                        item['delivered_at'] = datetime.fromisoformat(item['delivered_at'])
+
+                    # Convert to Event model
+                    event = Event(**item)
+                    all_events.append(event)
+
+                # Handle unprocessed keys (retry logic could be added here)
+                unprocessed = response.get('UnprocessedKeys', {})
+                if unprocessed:
+                    logger.warning(
+                        f"Some keys not processed in chunk {chunk_idx}",
+                        unprocessed_count=len(unprocessed.get('Keys', [])),
+                        total_in_chunk=len(chunk),
+                        table_name=self.table_name
+                    )
+                    # For now, we don't retry unprocessed keys
+
+                logger.info(
+                    f"Processed batch get chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    found=len(items),
+                    unprocessed=len(unprocessed.get('Keys', [])),
+                    table_name=self.table_name
+                )
+
+            except ClientError as e:
+                logger.error(
+                    f"Failed to batch get chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    table_name=self.table_name,
+                    error_code=e.response['Error']['Code'],
+                    error_message=e.response['Error']['Message']
+                )
+                # Skip failed chunks (items in this chunk won't be returned)
+
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error in batch get chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    table_name=self.table_name,
+                    error=str(e)
+                )
+                # Skip failed chunks
+
+        logger.info(
+            "Batch get events completed",
+            requested=len(event_ids),
+            found=len(all_events),
+            table_name=self.table_name
+        )
+
+        return all_events
+
+    async def batch_delete_events(self, event_ids: List[str]) -> Dict[str, Any]:
+        """
+        Delete multiple events by ID with internal chunking.
+
+        Processes event_ids in chunks of 25 (DynamoDB batch_write_item limit).
+        Uses batch_write_item with DeleteRequest for efficiency.
+        Continues processing even if some deletions fail.
+
+        Args:
+            event_ids: List of event IDs to delete
+
+        Returns:
+            Dict with 'successful_event_ids' list and 'failed_event_ids' list
+
+        Raises:
+            ValueError: If event_ids list is invalid
+        """
+        if not isinstance(event_ids, list):
+            raise ValueError("event_ids must be a list")
+        if not event_ids:
+            return {"successful_event_ids": [], "failed_event_ids": []}
+        if len(event_ids) > 100:
+            raise ValueError("batch size cannot exceed 100 events")
+
+        # Validate event IDs
+        for event_id in event_ids:
+            if not isinstance(event_id, str) or not event_id.strip():
+                raise ValueError("all event_ids must be non-empty strings")
+
+        from utils.batch_helpers import chunk_list
+        successful_event_ids = []
+        failed_event_ids = []
+
+        # Process event_ids in chunks of 25 (DynamoDB batch limit)
+        chunks = chunk_list(event_ids, 25)
+
+        for chunk_idx, chunk in enumerate(chunks):
+            try:
+                # Prepare batch delete request
+                request_items = {}
+                for event_id in chunk:
+                    request_items[f"{self.table_name}"] = request_items.get(f"{self.table_name}", [])
+                    request_items[f"{self.table_name}"].append({
+                        "DeleteRequest": {"Key": {"event_id": event_id}}
+                    })
+
+                # Execute batch delete
+                response = self.dynamodb.batch_write_item(RequestItems=request_items)
+
+                # Handle unprocessed items
+                unprocessed = response.get('UnprocessedItems', {}).get(self.table_name, [])
+                if unprocessed:
+                    logger.warning(
+                        f"Some items not deleted in chunk {chunk_idx}",
+                        unprocessed_count=len(unprocessed),
+                        total_in_chunk=len(chunk),
+                        table_name=self.table_name
+                    )
+                    # Mark unprocessed items as failed
+                    for unprocessed_item in unprocessed:
+                        key = unprocessed_item.get('DeleteRequest', {}).get('Key', {})
+                        if 'event_id' in key:
+                            failed_event_ids.append(key['event_id'])
+
+                # Mark successful deletions
+                processed_event_ids = list(chunk)  # Copy chunk
+                for unprocessed_item in unprocessed:
+                    key = unprocessed_item.get('DeleteRequest', {}).get('Key', {})
+                    if 'event_id' in key and key['event_id'] in processed_event_ids:
+                        processed_event_ids.remove(key['event_id'])
+
+                successful_event_ids.extend(processed_event_ids)
+
+                logger.info(
+                    f"Processed batch delete chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    successful=len(processed_event_ids),
+                    failed=len(unprocessed),
+                    table_name=self.table_name
+                )
+
+            except ClientError as e:
+                logger.error(
+                    f"Failed to batch delete chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    table_name=self.table_name,
+                    error_code=e.response['Error']['Code'],
+                    error_message=e.response['Error']['Message']
+                )
+                # Mark entire chunk as failed
+                failed_event_ids.extend(chunk)
+
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error in batch delete chunk {chunk_idx}",
+                    chunk_size=len(chunk),
+                    table_name=self.table_name,
+                    error=str(e)
+                )
+                # Mark entire chunk as failed
+                failed_event_ids.extend(chunk)
+
+        logger.info(
+            "Batch delete events completed",
+            total_events=len(event_ids),
+            successful=len(successful_event_ids),
+            failed=len(failed_event_ids),
+            table_name=self.table_name
+        )
+
+        return {
+            "successful_event_ids": successful_event_ids,
+            "failed_event_ids": failed_event_ids
+        }
+
+    async def batch_get_events_by_idempotency_keys(
+        self,
+        user_id: Optional[str],
+        idempotency_keys: List[str]
+    ) -> Dict[str, Event]:
+        """
+        Retrieve multiple events by user-scoped idempotency keys.
+
+        Since DynamoDB doesn't support batch queries on GSIs, this method
+        makes individual queries for each key. Uses concurrent execution
+        for better performance when multiple keys are requested.
+
+        Args:
+            user_id: User identifier (required for user-scoped deduplication)
+            idempotency_keys: List of idempotency keys to look up
+
+        Returns:
+            Dict mapping idempotency_key -> Event (only found events included)
+
+        Raises:
+            ValueError: If parameters are invalid
+        """
+        if not isinstance(idempotency_keys, list):
+            raise ValueError("idempotency_keys must be a list")
+        if not idempotency_keys:
+            return {}
+        if len(idempotency_keys) > 100:
+            raise ValueError("batch size cannot exceed 100 keys")
+
+        # Validate idempotency keys
+        for key in idempotency_keys:
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("all idempotency_keys must be non-empty strings")
+
+        # When auth is disabled, user_id is None. For now, we don't support
+        # global deduplication - only user-scoped deduplication when user_id is provided.
+        if user_id is None:
+            logger.warning(
+                "Cannot batch check idempotency without user_id - auth is currently disabled",
+                keys_count=len(idempotency_keys),
+                table_name=self.table_name
+            )
+            return {}
+
+        import asyncio
+        from typing import Dict
+
+        async def get_event_by_key(key: str) -> tuple[str, Optional[Event]]:
+            """Get event for a single idempotency key."""
+            try:
+                event = await self.get_event_by_idempotency_key(user_id, key)
+                return key, event
+            except Exception as e:
+                logger.warning(
+                    "Error checking idempotency key",
+                    user_id=user_id,
+                    idempotency_key=key,
+                    error=str(e)
+                )
+                return key, None
+
+        # Execute queries concurrently for better performance
+        tasks = [get_event_by_key(key) for key in idempotency_keys]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Build result dictionary
+        events_by_key: Dict[str, Event] = {}
+        for result in results:
+            if isinstance(result, tuple) and len(result) == 2:
+                key, event = result
+                if event is not None:
+                    events_by_key[key] = event
+            elif isinstance(result, Exception):
+                logger.error(
+                    "Exception during idempotency key lookup",
+                    error=str(result)
+                )
+
+        logger.info(
+            "Batch idempotency key lookup completed",
+            requested=len(idempotency_keys),
+            found=len(events_by_key),
+            user_id=user_id,
+            table_name=self.table_name
+        )
+
+        return events_by_key

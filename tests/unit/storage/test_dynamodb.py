@@ -360,3 +360,286 @@ class TestDynamoDBClient:
         )):
             with pytest.raises(ClientError):
                 await db_client.update_event(sample_event_model)
+
+
+class TestBatchDynamoDBOperations:
+    """Test cases for batch DynamoDB operations."""
+
+    @pytest.mark.asyncio
+    async def test_batch_put_events_single_chunk(self, db_client, mock_dynamodb_table):
+        """Test batch_put_events with single chunk (under 25 items)."""
+        # Create test events
+        events = []
+        for i in range(3):
+            event = Event(
+                event_id=f"evt_test{i:03d}",
+                event_type="order.created",
+                payload={"order_id": f"{i}", "amount": 99.99},
+                status="pending",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc)
+            )
+            events.append(event)
+
+        # Call batch put
+        result = await db_client.batch_put_events(events)
+
+        # Assert results
+        assert "successful_event_ids" in result
+        assert "failed_items" in result
+        assert len(result["successful_event_ids"]) == 3
+        assert len(result["failed_items"]) == 0
+
+        # Verify events were stored
+        for event in events:
+            response = mock_dynamodb_table.get_item(Key={'event_id': event.event_id})
+            assert 'Item' in response
+
+    @pytest.mark.asyncio
+    async def test_batch_put_events_multiple_chunks(self, db_client, mock_dynamodb_table):
+        """Test batch_put_events with multiple chunks (over 25 items)."""
+        # Create 30 test events (will be split into 2 chunks of 25, then 5)
+        events = []
+        for i in range(30):
+            event = Event(
+                event_id=f"evt_test{i:03d}",
+                event_type="order.created",
+                payload={"order_id": f"{i}", "amount": 99.99},
+                status="pending",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc)
+            )
+            events.append(event)
+
+        # Call batch put
+        result = await db_client.batch_put_events(events)
+
+        # Assert results
+        assert len(result["successful_event_ids"]) == 30
+        assert len(result["failed_items"]) == 0
+
+        # Verify all events were stored
+        for event in events:
+            response = mock_dynamodb_table.get_item(Key={'event_id': event.event_id})
+            assert 'Item' in response
+
+    @pytest.mark.asyncio
+    async def test_batch_put_events_unprocessed_items(self, db_client):
+        """Test batch_put_events with unprocessed items (simulated throttling)."""
+        # Create test events
+        events = []
+        for i in range(2):
+            event = Event(
+                event_id=f"evt_test{i:03d}",
+                event_type="order.created",
+                payload={"order_id": f"{i}"},
+                status="pending",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc)
+            )
+            events.append(event)
+
+        # Mock batch_write_item to return unprocessed items
+        mock_response = {
+            'UnprocessedItems': {
+                db_client.table_name: [
+                    {
+                        'PutRequest': {
+                            'Item': {
+                                'event_id': 'evt_test001',
+                                'event_type': 'order.created'
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+
+        with patch.object(db_client.dynamodb, 'batch_write_item', return_value=mock_response):
+            result = await db_client.batch_put_events(events)
+
+            # One successful, one failed due to unprocessed
+            assert len(result["successful_event_ids"]) == 1
+            assert len(result["failed_items"]) == 1
+            assert result["failed_items"][0]["event_id"] == "evt_test001"
+            assert "Unprocessed" in result["failed_items"][0]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_batch_put_events_validation_errors(self, db_client):
+        """Test batch_put_events with validation errors."""
+        # Test with invalid inputs
+        with pytest.raises(ValueError, match="events must be a list"):
+            await db_client.batch_put_events("not a list")
+
+        with pytest.raises(ValueError, match="all items must be Event instances"):
+            await db_client.batch_put_events(["not an event"])
+
+        # Create 101 events (exceeds limit)
+        events = []
+        for i in range(101):
+            event = Event(
+                event_id=f"evt_test{i:03d}",
+                event_type="order.created",
+                payload={"order_id": f"{i}"},
+                status="pending",
+                created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc)
+            )
+            events.append(event)
+
+        with pytest.raises(ValueError, match="batch size cannot exceed 100 events"):
+            await db_client.batch_put_events(events)
+
+    @pytest.mark.asyncio
+    async def test_batch_get_events_success(self, db_client, mock_dynamodb_table, sample_event_model):
+        """Test batch_get_events with successful retrieval."""
+        # First store an event
+        await db_client.put_event(sample_event_model)
+
+        # Get the event via batch get
+        event_ids = [sample_event_model.event_id]
+        events = await db_client.batch_get_events(event_ids)
+
+        # Assert we got the event back
+        assert len(events) == 1
+        assert events[0].event_id == sample_event_model.event_id
+
+    @pytest.mark.asyncio
+    async def test_batch_get_events_some_missing(self, db_client, mock_dynamodb_table, sample_event_model):
+        """Test batch_get_events with some events missing."""
+        # Store one event
+        await db_client.put_event(sample_event_model)
+
+        # Try to get two events (one exists, one doesn't)
+        event_ids = [sample_event_model.event_id, "evt_nonexistent"]
+        events = await db_client.batch_get_events(event_ids)
+
+        # Should only return the existing event
+        assert len(events) == 1
+        assert events[0].event_id == sample_event_model.event_id
+
+    @pytest.mark.asyncio
+    async def test_batch_get_events_validation_errors(self, db_client):
+        """Test batch_get_events with validation errors."""
+        with pytest.raises(ValueError, match="event_ids must be a list"):
+            await db_client.batch_get_events("not a list")
+
+        with pytest.raises(ValueError, match="all event_ids must be non-empty strings"):
+            await db_client.batch_get_events([""])
+
+        # Create 101 event IDs (exceeds limit)
+        event_ids = [f"evt_test{i:03d}" for i in range(101)]
+        with pytest.raises(ValueError, match="batch size cannot exceed 100 events"):
+            await db_client.batch_get_events(event_ids)
+
+    @pytest.mark.asyncio
+    async def test_batch_delete_events_success(self, db_client, mock_dynamodb_table, sample_event_model):
+        """Test batch_delete_events with successful deletion."""
+        # First store an event
+        await db_client.put_event(sample_event_model)
+
+        # Verify it exists
+        response = mock_dynamodb_table.get_item(Key={'event_id': sample_event_model.event_id})
+        assert 'Item' in response
+
+        # Delete via batch delete
+        event_ids = [sample_event_model.event_id]
+        result = await db_client.batch_delete_events(event_ids)
+
+        # Assert successful deletion
+        assert len(result["successful_event_ids"]) == 1
+        assert len(result["failed_event_ids"]) == 0
+        assert result["successful_event_ids"][0] == sample_event_model.event_id
+
+        # Verify it's gone
+        response = mock_dynamodb_table.get_item(Key={'event_id': sample_event_model.event_id})
+        assert 'Item' not in response
+
+    @pytest.mark.asyncio
+    async def test_batch_delete_events_unprocessed(self, db_client):
+        """Test batch_delete_events with unprocessed items."""
+        event_ids = ["evt_test001", "evt_test002"]
+
+        # Mock batch_write_item to return unprocessed items
+        mock_response = {
+            'UnprocessedItems': {
+                db_client.table_name: [
+                    {
+                        'DeleteRequest': {
+                            'Key': {'event_id': 'evt_test002'}
+                        }
+                    }
+                ]
+            }
+        }
+
+        with patch.object(db_client.dynamodb, 'batch_write_item', return_value=mock_response):
+            result = await db_client.batch_delete_events(event_ids)
+
+            # One successful, one failed
+            assert len(result["successful_event_ids"]) == 1
+            assert len(result["failed_event_ids"]) == 1
+            assert result["failed_event_ids"][0] == "evt_test002"
+
+    @pytest.mark.asyncio
+    async def test_batch_delete_events_validation_errors(self, db_client):
+        """Test batch_delete_events with validation errors."""
+        with pytest.raises(ValueError, match="event_ids must be a list"):
+            await db_client.batch_delete_events("not a list")
+
+        with pytest.raises(ValueError, match="all event_ids must be non-empty strings"):
+            await db_client.batch_delete_events([""])
+
+        # Create 101 event IDs (exceeds limit)
+        event_ids = [f"evt_test{i:03d}" for i in range(101)]
+        with pytest.raises(ValueError, match="batch size cannot exceed 100 events"):
+            await db_client.batch_delete_events(event_ids)
+
+    @pytest.mark.asyncio
+    async def test_batch_get_events_by_idempotency_keys_success(self, db_client, mock_dynamodb_table):
+        """Test batch_get_events_by_idempotency_keys with successful lookup."""
+        # Create event with idempotency key
+        event = Event(
+            event_id="evt_test123456",
+            event_type="order.created",
+            payload={"order_id": "123"},
+            status="delivered",
+            created_at=datetime(2024, 1, 15, 10, 30, 1, tzinfo=timezone.utc),
+            user_id="user123",
+            idempotency_key="order-123-2024-01-15"
+        )
+
+        # Store the event
+        await db_client.put_event(event)
+
+        # Look up by idempotency key
+        result = await db_client.batch_get_events_by_idempotency_keys(
+            user_id="user123",
+            idempotency_keys=["order-123-2024-01-15", "nonexistent-key"]
+        )
+
+        # Should find the one existing event
+        assert len(result) == 1
+        assert "order-123-2024-01-15" in result
+        assert result["order-123-2024-01-15"].event_id == "evt_test123456"
+
+    @pytest.mark.asyncio
+    async def test_batch_get_events_by_idempotency_keys_no_user(self, db_client):
+        """Test batch_get_events_by_idempotency_keys with no user (auth disabled)."""
+        result = await db_client.batch_get_events_by_idempotency_keys(
+            user_id=None,
+            idempotency_keys=["any-key"]
+        )
+
+        # Should return empty dict when auth is disabled
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_batch_get_events_by_idempotency_keys_validation_errors(self, db_client):
+        """Test batch_get_events_by_idempotency_keys with validation errors."""
+        with pytest.raises(ValueError, match="idempotency_keys must be a list"):
+            await db_client.batch_get_events_by_idempotency_keys("user123", "not a list")
+
+        with pytest.raises(ValueError, match="all idempotency_keys must be non-empty strings"):
+            await db_client.batch_get_events_by_idempotency_keys("user123", [""])
+
+        # Create 101 keys (exceeds limit)
+        keys = [f"key{i}" for i in range(101)]
+        with pytest.raises(ValueError, match="batch size cannot exceed 100 keys"):
+            await db_client.batch_get_events_by_idempotency_keys("user123", keys)
