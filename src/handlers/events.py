@@ -24,7 +24,7 @@ from fastapi import status as status_codes
 from fastapi.responses import JSONResponse, Response
 from typing import Dict, List, Optional, Union
 
-from models.request import CreateEventRequest, UpdateEventRequest, BatchCreateEventRequest, BatchUpdateEventRequest, BatchDeleteEventRequest, ReplayEventRequest, BatchReplayEventRequest
+from models.request import CreateEventRequest, UpdateEventRequest, BatchCreateEventRequest, BatchUpdateEventRequest, BatchDeleteEventRequest, ReplayEventRequest, BatchReplayEventRequest, GetEventsByListRequest
 from models.response import EventResponse, BatchCreateResponse, BatchUpdateResponse, BatchDeleteResponse, BatchCreateItemResult, BatchUpdateItemResult, BatchDeleteItemResult, BatchItemError, BatchOperationSummary, ReplayResponse, BatchReplayItemResult, BatchReplayResponse
 from models.event import Event
 from storage.dynamodb import DynamoDBClient
@@ -1594,6 +1594,93 @@ async def get_event(
         idempotency_key=event.idempotency_key,
         message="Event retrieved successfully"
     )
+
+
+@router.post("/list", response_model=List[EventResponse])
+async def get_events_by_list(
+    request_body: GetEventsByListRequest,
+    db_client: DynamoDBClient = Depends(get_db_client)
+) -> List[EventResponse]:
+    """
+    Retrieve multiple events by providing a list of event IDs.
+
+    Fetches multiple events from DynamoDB in a single batch request.
+    Events that don't exist are silently omitted from the results.
+
+    Args:
+        request_body: Request containing list of event_ids to retrieve
+        db_client: DynamoDB client (injected via dependency)
+
+    Returns:
+        List of EventResponse objects for found events
+
+    Raises:
+        HTTPException: 400 if invalid request parameters
+        HTTPException: 500 if database error
+
+    Example:
+        POST /events/list
+        Body: {"event_ids": ["evt_abc123xyz456", "evt_def789ghi012"]}
+
+        Response (200):
+        [
+            {
+                "event_id": "evt_abc123xyz456",
+                "status": "delivered",
+                "created_at": "2024-01-15T10:30:01Z",
+                "delivered_at": "2024-01-15T10:30:02Z",
+                "message": "Event retrieved successfully"
+            },
+            {
+                "event_id": "evt_def789ghi012",
+                "status": "pending",
+                "created_at": "2024-01-15T10:31:00Z",
+                "message": "Event retrieved successfully"
+            }
+        ]
+    """
+    try:
+        # Use the existing batch_get_events method which handles chunking
+        events = await db_client.batch_get_events(request_body.event_ids)
+        
+        logger.info(
+            "Retrieved events by list",
+            requested_count=len(request_body.event_ids),
+            found_count=len(events)
+        )
+        
+        # Convert Event objects to EventResponse objects
+        response_events = [
+            EventResponse(
+                event_id=event.event_id,
+                event_type=event.event_type,
+                payload=event.payload,
+                metadata=event.metadata,
+                status=event.status,
+                created_at=event.created_at,
+                delivered_at=event.delivered_at,
+                delivery_attempts=event.delivery_attempts,
+                user_id=event.user_id,
+                idempotency_key=event.idempotency_key,
+                message="Event retrieved successfully"
+            )
+            for event in events
+        ]
+        
+        return response_events
+        
+    except ValueError as e:
+        logger.warning("Invalid request for get_events_by_list", error=str(e))
+        raise HTTPException(
+            status_code=status_codes.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error("Database error retrieving events by list", error=str(e))
+        raise HTTPException(
+            status_code=status_codes.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve events"
+        )
 
 
 @router.get("", response_model=List[EventResponse])

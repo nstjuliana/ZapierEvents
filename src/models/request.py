@@ -545,3 +545,48 @@ class BatchReplayEventRequest(BaseModel):
                 raise ValueError(f"invalid event_id format: {event_id}")
 
         return v
+
+
+class GetEventsByListRequest(BaseModel):
+    """
+    Request model for retrieving multiple events by ID list.
+
+    Allows clients to fetch multiple specific events in a single request
+    by providing a list of event_ids.
+
+    Attributes:
+        event_ids: List of event IDs to retrieve (max 100)
+    """
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        validate_assignment=True
+    )
+
+    event_ids: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="List of event IDs to retrieve (max 100)"
+    )
+
+    @field_validator('event_ids')
+    @classmethod
+    def validate_event_ids_list(cls, v: List[str]) -> List[str]:
+        """Validate the event_ids list."""
+        if not v:
+            raise ValueError("event_ids list cannot be empty")
+        if len(v) > 100:
+            raise ValueError("batch size cannot exceed 100 events")
+
+        # Validate each event_id format
+        for event_id in v:
+            if not isinstance(event_id, str):
+                raise ValueError("all event_ids must be strings")
+            if not event_id.strip():
+                raise ValueError("event_ids cannot be empty strings")
+            import re
+            if not re.match(r'^evt_[a-z0-9]{12}$', event_id):
+                raise ValueError(f"invalid event_id format: {event_id}")
+
+        return v
