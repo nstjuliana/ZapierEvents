@@ -802,20 +802,85 @@ async def batch_update_events(
         # Get user_id from auth context
         user_id = get_user_id_from_request(http_request)
 
-        # Validate batch size
-        from utils.batch_helpers import validate_batch_size
-        validate_batch_size(request.events, 100)
-
-        logger.info(
-            "Starting batch update",
-            batch_size=len(request.events),
-            user_id=user_id
-        )
+        # Check if this is filter mode or list mode
+        is_filter_mode = request.events is None
+        
+        if is_filter_mode:
+            # Filter mode: Parse query parameters and get matching events
+            query_params = dict(http_request.query_params)
+            filters = parse_filter_params(query_params)
+            
+            if not filters and 'status' not in query_params:
+                raise ValueError(
+                    "Filter mode requires at least one query parameter filter "
+                    "(e.g., ?payload.field=value or ?status=pending)"
+                )
+            
+            logger.info(
+                "Starting filtered batch update",
+                filters=bool(filters),
+                status_filter=query_params.get('status'),
+                user_id=user_id
+            )
+            
+            # Get matching events (up to 100)
+            matching_events = await db_client.list_events(
+                status=query_params.get('status'),
+                limit=100,
+                cursor=None,
+                filters=filters
+            )
+            
+            # Build batch update items from filter results, filtering by user_id for ownership
+            from models.request import BatchUpdateEventItem
+            batch_items = []
+            for event in matching_events:
+                # Skip events that don't belong to this user (if auth is enabled)
+                if user_id is not None and event.user_id != user_id:
+                    continue
+                item = BatchUpdateEventItem(
+                    event_id=event.event_id,
+                    payload=request.payload,
+                    metadata=request.metadata,
+                    idempotency_key=request.idempotency_key
+                )
+                batch_items.append(item)
+            
+            if not batch_items:
+                # No events matched the filter (after user filtering)
+                logger.info("No events matched the filter criteria for this user")
+                return BatchUpdateResponse(
+                    results=[],
+                    summary=BatchOperationSummary(
+                        total=0,
+                        successful=0,
+                        idempotent=0,
+                        failed=0
+                    )
+                )
+            
+            logger.info(
+                "Filtered batch update found matching events",
+                matched_count=len(batch_items)
+            )
+        else:
+            # List mode: Use provided events list
+            batch_items = request.events
+            
+            # Validate batch size
+            from utils.batch_helpers import validate_batch_size
+            validate_batch_size(batch_items, 100)
+            
+            logger.info(
+                "Starting batch update",
+                batch_size=len(batch_items),
+                user_id=user_id
+            )
 
         results: List[BatchUpdateItemResult] = []
 
         # Extract all event_ids for batch retrieval
-        event_ids = [item.event_id for item in request.events]
+        event_ids = [item.event_id for item in batch_items]
 
         # Batch get existing events from DynamoDB
         existing_events = await db_client.batch_get_events(event_ids)
@@ -825,7 +890,7 @@ async def batch_update_events(
         events_to_update: List[Event] = []
         index_map: Dict[str, int] = {}  # event_id -> original index
 
-        for idx, item in enumerate(request.events):
+        for idx, item in enumerate(batch_items):
             try:
                 # Check if event exists
                 event = events_by_id.get(item.event_id)
@@ -1044,7 +1109,7 @@ async def batch_update_events(
             metrics_client.put_metric(
                 metric_name="BatchUpdateEvents",
                 value=1.0,
-                dimensions={"BatchSize": str(len(request.events))}
+                dimensions={"BatchSize": str(len(batch_items))}
             )
         except Exception:
             pass
@@ -1054,7 +1119,8 @@ async def batch_update_events(
             total=len(results),
             successful=successful_count,
             failed=failed_count,
-            user_id=user_id
+            user_id=user_id,
+            filter_mode=is_filter_mode
         )
 
         return BatchUpdateResponse(
@@ -1152,26 +1218,136 @@ async def batch_delete_events(
         # Get user_id from auth context
         user_id = get_user_id_from_request(http_request)
 
-        # Validate batch size
-        from utils.batch_helpers import validate_batch_size
-        validate_batch_size(request.event_ids, 100)
-
+        # Parse query parameters for filter mode
+        query_params = dict(http_request.query_params)
+        filters = parse_filter_params(query_params)
+        has_filters = bool(filters) or 'status' in query_params
+        
+        # Collect event IDs from both filters and request body
+        event_ids_set = set()
+        
+        if has_filters:
+            # Filter mode: Get matching events
+            logger.info(
+                "Starting filtered batch delete",
+                filters=bool(filters),
+                status_filter=query_params.get('status'),
+                has_body_event_ids=request.event_ids is not None,
+                user_id=user_id
+            )
+            
+            # Get matching events (up to 100)
+            matching_events = await db_client.list_events(
+                status=query_params.get('status'),
+                limit=100,
+                cursor=None,
+                filters=filters
+            )
+            
+            logger.info(
+                "list_events returned results for filtered batch delete",
+                count=len(matching_events),
+                event_ids=[e.event_id for e in matching_events] if matching_events else []
+            )
+            
+            # Add filtered event IDs to the set, filtering by user_id for ownership
+            for event in matching_events:
+                # Skip events that don't belong to this user (if auth is enabled)
+                if user_id is not None and event.user_id != user_id:
+                    logger.debug(
+                        "Skipping event from different user in filtered batch delete",
+                        event_id=event.event_id,
+                        event_user=event.user_id,
+                        requested_by=user_id
+                    )
+                    continue
+                
+                # Defensive check: skip events with missing critical fields
+                if not event.event_id or not hasattr(event, 'payload'):
+                    logger.warning(
+                        "Skipping malformed event in filtered batch delete",
+                        event_id=getattr(event, 'event_id', 'UNKNOWN'),
+                        has_payload=hasattr(event, 'payload')
+                    )
+                    continue
+                    
+                event_ids_set.add(event.event_id)
+                logger.debug(
+                    "Added event to filtered batch delete",
+                    event_id=event.event_id,
+                    event_type=getattr(event, 'event_type', 'UNKNOWN')
+                )
+            
+            logger.info(
+                "Filtered batch delete found matching events",
+                matched_count=len(event_ids_set)
+            )
+        
+        # Add event IDs from request body if provided (union with filtered results)
+        if request.event_ids:
+            event_ids_set.update(request.event_ids)
+            logger.info(
+                "Combined filter results with body event_ids",
+                total_count=len(event_ids_set)
+            )
+        
+        # Check if we have any event IDs to delete
+        if not event_ids_set:
+            if has_filters:
+                # No events matched the filter
+                logger.info("No events matched the filter criteria")
+                return BatchDeleteResponse(
+                    results=[],
+                    summary=BatchOperationSummary(
+                        total=0,
+                        successful=0,
+                        idempotent=0,
+                        failed=0
+                    )
+                )
+            else:
+                # No filters and no event_ids in body
+                raise ValueError(
+                    "Either provide event_ids in the request body or use query parameter filters "
+                    "(e.g., ?payload.field=value or ?status=pending)"
+                )
+        
+        # Convert to list and enforce batch size limit
+        event_ids_list = list(event_ids_set)[:100]  # Cap at 100 events
+        
+        if len(event_ids_set) > 100:
+            logger.warning(
+                "Batch delete exceeded 100 events, capping at 100",
+                requested_count=len(event_ids_set)
+            )
+        
         logger.info(
             "Starting batch delete",
-            batch_size=len(request.event_ids),
-            user_id=user_id
+            batch_size=len(event_ids_list),
+            user_id=user_id,
+            filter_mode=has_filters
         )
 
         results: List[BatchDeleteItemResult] = []
 
         # Batch get existing events from DynamoDB to check ownership
-        existing_events = await db_client.batch_get_events(request.event_ids)
+        existing_events = await db_client.batch_get_events(event_ids_list)
         events_by_id = {event.event_id: event for event in existing_events}
+        
+        # Check for events that were in list_events but not in batch_get_events (stale index)
+        missing_event_ids = set(event_ids_list) - set(events_by_id.keys())
+        if missing_event_ids:
+            logger.warning(
+                "Events from list_events not found in batch_get_events (stale index or concurrent deletion)",
+                count=len(missing_event_ids),
+                event_ids=list(missing_event_ids),
+                note="These will be treated as idempotent deletes"
+            )
 
         # Process each deletion in the batch
         event_ids_to_delete = []
 
-        for idx, event_id in enumerate(request.event_ids):
+        for idx, event_id in enumerate(event_ids_list):
             try:
                 # Check if event exists
                 event = events_by_id.get(event_id)
@@ -1250,7 +1426,7 @@ async def batch_delete_events(
             for failed_event_id in failed_event_ids:
                 # Find original index for this event_id
                 original_idx = None
-                for idx, event_id in enumerate(request.event_ids):
+                for idx, event_id in enumerate(event_ids_list):
                     if event_id == failed_event_id:
                         original_idx = idx
                         break
@@ -1271,7 +1447,7 @@ async def batch_delete_events(
             if event_id in successful_event_ids:
                 # Find original index for this event_id
                 original_idx = None
-                for idx, req_event_id in enumerate(request.event_ids):
+                for idx, req_event_id in enumerate(event_ids_list):
                     if req_event_id == event_id:
                         original_idx = idx
                         break
@@ -1296,11 +1472,13 @@ async def batch_delete_events(
         # Calculate summary
         successful_count = sum(1 for r in results if r.success)
         failed_count = len(results) - successful_count
+        # Count idempotent deletions (events that were already deleted)
+        idempotent_count = sum(1 for r in results if r.success and r.message == "Event already deleted (idempotent)")
 
         summary = BatchOperationSummary(
             total=len(results),
             successful=successful_count,
-            idempotent=0,  # Not applicable for deletes
+            idempotent=idempotent_count,
             failed=failed_count
         )
 
@@ -1309,7 +1487,7 @@ async def batch_delete_events(
             metrics_client.put_metric(
                 metric_name="BatchDeleteEvents",
                 value=1.0,
-                dimensions={"BatchSize": str(len(request.event_ids))}
+                dimensions={"BatchSize": str(len(event_ids_list))}
             )
         except Exception:
             pass
@@ -1318,8 +1496,10 @@ async def batch_delete_events(
             "Batch delete completed",
             total=len(results),
             successful=successful_count,
+            idempotent=idempotent_count,
             failed=failed_count,
-            user_id=user_id
+            user_id=user_id,
+            filter_mode=has_filters
         )
 
         return BatchDeleteResponse(

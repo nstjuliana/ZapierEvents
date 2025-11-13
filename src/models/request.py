@@ -305,11 +305,18 @@ class BatchUpdateEventRequest(BaseModel):
     """
     Request model for batch updating events.
 
-    Contains a list of BatchUpdateEventItem objects to be processed
-    as a batch operation with best-effort semantics.
+    Supports two modes:
+    1. List mode: Provide a list of BatchUpdateEventItem objects (traditional batch update)
+    2. Filter mode: Provide query filters and a single update object to apply to all matching events
+    
+    In filter mode (when query params are used), provide payload, metadata, and/or idempotency_key
+    to apply to all events matching the filter criteria.
 
     Attributes:
-        events: List of event update requests (max 100)
+        events: List of event update requests (max 100) - for list mode
+        payload: Single payload to apply to all filtered events - for filter mode
+        metadata: Single metadata to apply to all filtered events - for filter mode
+        idempotency_key: Single idempotency_key to apply to all filtered events - for filter mode
     """
 
     model_config = ConfigDict(
@@ -317,33 +324,111 @@ class BatchUpdateEventRequest(BaseModel):
         validate_assignment=True
     )
 
-    events: List[BatchUpdateEventItem] = Field(
-        ...,
+    # List mode fields
+    events: Optional[List[BatchUpdateEventItem]] = Field(
+        default=None,
         min_length=1,
         max_length=100,
-        description="List of events to update (max 100)"
+        description="List of events to update (max 100) - for list mode"
+    )
+    
+    # Filter mode fields
+    payload: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Updated event payload data to apply to all filtered events"
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Updated event metadata to apply to all filtered events"
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description="Updated idempotency key to apply to all filtered events"
     )
 
     @field_validator('events')
     @classmethod
-    def validate_events_list(cls, v: List[BatchUpdateEventItem]) -> List[BatchUpdateEventItem]:
+    def validate_events_list(cls, v: Optional[List[BatchUpdateEventItem]]) -> Optional[List[BatchUpdateEventItem]]:
         """Validate the events list."""
+        if v is None:
+            return v
         if not v:
             raise ValueError("events list cannot be empty")
         if len(v) > 100:
             raise ValueError("batch size cannot exceed 100 events")
         return v
+    
+    @field_validator('payload', mode='before')
+    @classmethod
+    def validate_payload(cls, v: Any) -> Optional[Dict[str, Any]]:
+        """Validate payload is a non-empty dictionary if provided."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("payload must be a dictionary")
+        if not v:
+            raise ValueError("payload cannot be empty")
+        return v
+
+    @field_validator('metadata', mode='before')
+    @classmethod
+    def validate_metadata(cls, v: Any) -> Optional[Dict[str, Any]]:
+        """Validate metadata is a dictionary if provided."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("metadata must be a dictionary")
+        return v
+
+    @field_validator('idempotency_key')
+    @classmethod
+    def validate_idempotency_key(cls, v: Optional[str]) -> Optional[str]:
+        """Validate idempotency key format if provided."""
+        if v is None:
+            return v
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("idempotency_key must be a non-empty string")
+        import re
+        if not re.match(r'^[a-zA-Z0-9._:-]+$', v):
+            raise ValueError(
+                "idempotency_key must contain only letters, numbers, dots, underscores, hyphens, and colons"
+            )
+        return v.strip()
+    
+    @model_validator(mode='after')
+    def validate_mode(self) -> 'BatchUpdateEventRequest':
+        """Ensure either list mode or filter mode is used, not both."""
+        has_events = self.events is not None
+        has_filter_fields = any([
+            self.payload is not None,
+            self.metadata is not None,
+            self.idempotency_key is not None
+        ])
+        
+        # At least one mode must be used
+        if not has_events and not has_filter_fields:
+            raise ValueError(
+                "Either provide 'events' list (list mode) or filter fields "
+                "(payload/metadata/idempotency_key for filter mode)"
+            )
+        
+        return self
 
 
 class BatchDeleteEventRequest(BaseModel):
     """
     Request model for batch deleting events.
 
-    Contains a list of event_ids to delete with best-effort semantics.
-    Missing events are treated as successful (idempotent delete).
+    Supports two modes:
+    1. List mode: Provide a list of event_ids to delete (traditional batch delete)
+    2. Filter mode: Use query parameters to filter events, optionally combine with event_ids list
+    
+    When using filter mode, event_ids is optional. If provided, it will be combined
+    with the filtered results (union).
 
     Attributes:
-        event_ids: List of event IDs to delete (max 100)
+        event_ids: Optional list of event IDs to delete (max 100 combined with filters)
     """
 
     model_config = ConfigDict(
@@ -351,19 +436,21 @@ class BatchDeleteEventRequest(BaseModel):
         validate_assignment=True
     )
 
-    event_ids: List[str] = Field(
-        ...,
+    event_ids: Optional[List[str]] = Field(
+        default=None,
         min_length=1,
         max_length=100,
-        description="List of event IDs to delete (max 100)"
+        description="Optional list of event IDs to delete (max 100, combined with filter results)"
     )
 
     @field_validator('event_ids')
     @classmethod
-    def validate_event_ids_list(cls, v: List[str]) -> List[str]:
+    def validate_event_ids_list(cls, v: Optional[List[str]]) -> Optional[List[str]]:
         """Validate the event_ids list."""
+        if v is None:
+            return v
         if not v:
-            raise ValueError("event_ids list cannot be empty")
+            raise ValueError("event_ids list cannot be empty if provided")
         if len(v) > 100:
             raise ValueError("batch size cannot exceed 100 events")
 
